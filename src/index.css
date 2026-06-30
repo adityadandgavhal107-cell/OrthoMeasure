@@ -1,0 +1,136 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg:         #F9FBFD;
+  --surface:    #FFFFFF;
+  --ink:        #0F172A;
+  --ink-2:      #475569;
+  --ink-3:      #94A3B8;
+  --ink-4:      #E2E8F0;
+  --bdr:        #E2E8F0;
+  --bdr-2:      #CBD5E1;
+  --accent:     #6366F1;
+  --accent-bg:  #EEF2FF;
+  --accent-bdr: rgba(99,102,241,0.25);
+  --green:      #10B981;
+  --green-bg:   #ECFDF5;
+  --green-bdr:  rgba(16,185,129,0.2);
+  --amber:      #F59E0B;
+  --amber-bg:   #FEF3C7;
+  --amber-bdr:  rgba(245,158,11,0.25);
+  --red:        #EF4444;
+  --red-bg:     #FEF2F2;
+  --red-bdr:    rgba(239,68,68,0.2);
+  --r:          8px;
+  --mono:       'JetBrains Mono', 'Fira Code', monospace;
+  
+  /* Medical specialized colors */
+  --lidar-blue: #0ea5e9;
+  --lidar-bg: rgba(14, 165, 233, 0.08);
+  --lidar-bdr: rgba(14, 165, 233, 0.35);
+  --scangrid: rgba(16, 185, 129, 0.04);
+}
+
+.dark {
+  --bg:         #0B0F19;
+  --surface:    #111827;
+  --ink:        #F9FAFB;
+  --ink-2:      #9CA3AF;
+  --ink-3:      #6B7280;
+  --ink-4:      #374151;
+  --bdr:        #1F2937;
+  --bdr-2:      #374151;
+  --accent:     #818CF8;
+  --accent-bg:  #1E1B4B;
+  --accent-bdr: rgba(129,140,248,0.3);
+  --green:      #34D399;
+  --green-bg:   #064E3B;
+  --green-bdr:  rgba(52,211,153,0.3);
+  --amber:      #FBBF24;
+  --amber-bg:   #78350F;
+  --amber-bdr:  rgba(251,191,36,0.3);
+  --red:        #F87171;
+  --red-bg:     #7F1D1D;
+  --red-bdr:    rgba(248,113,113,0.3);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--bdr-2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
+
+/* Custom Animations */
+@keyframes lidarPulse {
+  0% { transform: scale(0.96); opacity: 0.2; }
+  50% { transform: scale(1.02); opacity: 0.6; }
+  100% { transform: scale(0.96); opacity: 0.2; }
+}
+
+.lidar-pulse {
+  animation: lidarPulse 2.5s infinite ease-in-out;
+}
+
+@keyframes scanLine {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+
+.scanner-overlay::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(to bottom, transparent 48%, var(--green) 50%, transparent 52%);
+  background-size: 100% 200px;
+  opacity: 0.35;
+  pointer-events: none;
+  animation: scanLine 4s infinite linear;
+}
+
+.scanner-overlay-lidar::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(to bottom, transparent 48%, var(--lidar-blue) 50%, transparent 52%);
+  background-size: 100% 200px;
+  opacity: 0.45;
+  pointer-events: none;
+  animation: scanLine 3s infinite linear;
+}
+
+.grid-bg {
+  background-size: 20px 20px;
+  background-image: 
+    linear-gradient(to right, var(--bdr) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--bdr) 1px, transparent 1px);
+}
+
+.grid-bg-lidar {
+  background-size: 15px 15px;
+  background-image: 
+    linear-gradient(to right, rgba(14,165,233,0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(14,165,233,0.06) 1px, transparent 1px);
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin-slow 20s infinite linear;
+}
+
