@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { supabase } from '../data/supabase'
 
 interface Props { onLogin: (email: string, role: 'Doctor' | 'Technician') => void }
 
@@ -13,15 +14,29 @@ export default function Login({ onLogin }: Props) {
     if (!email || !password) { setError('Please fill in all fields.'); return }
     setLoading(true)
     setError('')
-    await new Promise(r => setTimeout(r, 600)) // swap for real auth call
     
-    const normalizedEmail = email.toLowerCase().trim()
-    if (normalizedEmail === 'admin@ortho.com' && password === 'password') {
-      onLogin('admin@ortho.com', 'Doctor')
-    } else if (normalizedEmail === 'tech@ortho.com' && password === 'password') {
-      onLogin('tech@ortho.com', 'Technician')
-    } else {
-      setError('Invalid clinic credentials.')
+    try {
+      const normalizedEmail = email.toLowerCase().trim()
+      const { data, error: authError } = await supabase.auth.signInWithPassword({
+        email: normalizedEmail,
+        password: password,
+      })
+
+      if (authError) {
+        setError(authError.message)
+        setLoading(false)
+        return
+      }
+
+      if (data.user) {
+        const role = normalizedEmail.includes('admin') || normalizedEmail.includes('doctor') ? 'Doctor' : 'Technician'
+        onLogin(normalizedEmail, role)
+      } else {
+        setError('Authentication failed. No user returned.')
+        setLoading(false)
+      }
+    } catch (err: any) {
+      setError(err.message || 'An error occurred during authentication.')
       setLoading(false)
     }
   }
@@ -106,17 +121,7 @@ export default function Login({ onLogin }: Props) {
           </button>
         </form>
 
-        <div style={{
-          marginTop: 20, fontSize: 11, color: 'var(--ink-3)',
-          background: 'var(--surface)', border: '1px solid var(--bdr)',
-          borderRadius: 6, padding: '10px 12px', textAlign: 'center', lineHeight: 1.6
-        }}>
-          <strong>Demo Logins (Password: password):</strong>
-          <br />
-          Doctor Workspace: <code style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', fontWeight: 600 }}>admin@ortho.com</code>
-          <br />
-          Technician Scanner: <code style={{ fontFamily: 'var(--mono)', color: 'var(--green)', fontWeight: 600 }}>tech@ortho.com</code>
-        </div>
+      
       </div>
     </div>
   )

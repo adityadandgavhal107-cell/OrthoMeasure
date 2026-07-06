@@ -6,10 +6,10 @@ import CaseQueue from './components/queue/CaseQueue'
 import CaseDetail from './components/detail/CaseDetail'
 import Login from './pages/Login'
 import PatientRegistration from './components/registration/PatientRegistration'
-import GuidedCapture from './components/guided/GuidedCapture'
 import DeviceDiagnostics from './components/devices/DeviceDiagnostics'
 import AuditTrail from './components/audit/AuditTrail'
-import { fetchCases, writeAuditLog } from './data/api'
+import { fetchCases, writeAuditLog, saveNewCase } from './data/api'
+import { supabase } from './data/supabase'
 
 const SESSION_MAX = 180 // 3 minutes timeout
 
@@ -22,9 +22,6 @@ export default function App() {
   const [activeView, setActiveView] = useState<'queue' | 'register' | 'capture' | 'devices' | 'analytics' | 'audit'>('queue')
   const [activeFilter, setActiveFilter] = useState<CaseStatus | 'all'>('all')
   const [selected, setSelected] = useState<OrthoCase | null>(null)
-  
-  // Patient flow state
-  const [registeredPatient, setRegisteredPatient] = useState<any | null>(null)
   
   // Theme state
   const [theme, setTheme] = useState<'light' | 'dark'>('light')
@@ -112,12 +109,12 @@ export default function App() {
         timedOut ? 'Workspace locked automatically due to inactivity watchdog.' : 'Closed clinical workstation session.'
       )
     }
+    supabase.auth.signOut()
     setAuthed(false)
     setUserEmail('')
     setSelected(null)
     setActiveView('queue')
     setActiveFilter('all')
-    setRegisteredPatient(null)
     setShowTimeoutWarn(false)
   }, [userEmail, userRole])
 
@@ -205,31 +202,36 @@ export default function App() {
 
           {activeView === 'register' && (
             <PatientRegistration 
-              onRegister={(data) => {
-                setRegisteredPatient(data)
-                setActiveView('capture')
-              }}
-              onCancel={() => {
+              onRegister={async (data) => {
+                const id = `OM-2024-${String(Math.floor(Math.random() * 900) + 100)}`
+                const newCase: OrthoCase = {
+                  ...data,
+                  id,
+                  submittedAt: new Date().toISOString(),
+                  status: 'pending', // Sets status to pending waiting for mobile scan
+                  doctorName: userEmail,
+                  overallQuality: 0,
+                  images: [],
+                  measurements: [],
+                  castType: 'Standard Cast',
+                  castThickness: 3.5,
+                  castColor: 'Medical White',
+                  ventPattern: 'Circular mesh'
+                }
+                
+                await saveNewCase(newCase)
+                writeAuditLog(
+                  userEmail,
+                  userRole,
+                  'Patient Registered',
+                  `Patient ${newCase.patientName} (${newCase.id}) was successfully registered. Status set to Pending Scan Capture.`
+                )
+                
                 setActiveView('queue')
-              }}
-            />
-          )}
-
-          {activeView === 'capture' && registeredPatient && (
-            <GuidedCapture 
-              patientData={registeredPatient}
-              doctorName={userRole === 'Doctor' ? 'Dr. Priya Kapoor' : 'Dr. Rajan Nair'}
-              userEmail={userEmail}
-              userRole={userRole}
-              onComplete={(newCase) => {
-                setRegisteredPatient(null)
-                setSelected(newCase)
-                setActiveView('queue')
-                setActiveFilter('review')
+                setActiveFilter('pending')
                 setRefreshKey(k => k + 1)
               }}
               onCancel={() => {
-                setRegisteredPatient(null)
                 setActiveView('queue')
               }}
             />

@@ -66,3 +66,17 @@ export interface AuditLog {
   details: string
 }
 
+export interface Device {
+  id: string
+  password?: string
+  name: string
+  os: 'iOS' | 'Android'
+  type: 'Tablet' | 'Phone'
+  lidar: boolean
+  battery: number
+  storage: string
+  status: 'online' | 'offline' | 'needs_calibration'
+  version: string
+  calibrationDate: string
+}
+

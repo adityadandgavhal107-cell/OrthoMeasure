@@ -7,7 +7,7 @@ export default function AuditTrail() {
   const [search, setSearch] = useState('')
 
   useEffect(() => {
-    setLogs(getStoredAuditLogs())
+    getStoredAuditLogs().then(setLogs)
   }, [])
 
   const filteredLogs = logs.filter(l => 

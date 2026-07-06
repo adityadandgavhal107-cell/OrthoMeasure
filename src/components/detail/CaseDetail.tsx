@@ -4,7 +4,45 @@ import { updateCaseStatus, updateCaseMeasurements, updateCaseCastSettings, write
 import StatusBadge from '../shared/StatusBadge'
 import ImageGrid from './ImageGrid'
 import MeasurementReadout from './MeasurementReadout'
+import Cast3DVisualizer from './Cast3DVisualizer'
 import { relativeTime } from '../../utils'
+
+// ── Default measurements per body part (used when scan has no stored measurements) ──
+function getDefaultMeasurements(bodyPart: string): Measurement[] {
+  const part = (bodyPart || 'Forearm').toLowerCase()
+  if (part.includes('wrist')) {
+    return [
+      { key: 'Wrist width',      value: 5.4,  unit: 'cm', confidence: 90, landmarkKeys: ['mid'] },
+      { key: 'Wrist depth',      value: 3.7,  unit: 'cm', confidence: 86, landmarkKeys: ['mid'] },
+      { key: 'Circumference',    value: 15.3, unit: 'cm', confidence: 91, landmarkKeys: ['mid', 'distal'] },
+      { key: 'Thumb base girth', value: 7.2,  unit: 'cm', confidence: 84, landmarkKeys: ['distal'] },
+    ]
+  }
+  if (part.includes('ankle')) {
+    return [
+      { key: 'Ankle height',       value: 9.6,  unit: 'cm', confidence: 82, landmarkKeys: ['proximal', 'mid'] },
+      { key: 'Malleolus width',    value: 7.4,  unit: 'cm', confidence: 79, landmarkKeys: ['mid'] },
+      { key: 'Heel circumference', value: 32.1, unit: 'cm', confidence: 76, landmarkKeys: ['mid', 'distal'] },
+      { key: 'Arch circumference', value: 24.8, unit: 'cm', confidence: 81, landmarkKeys: ['distal'] },
+    ]
+  }
+  if (part.includes('elbow')) {
+    return [
+      { key: 'Joint width',      value: 8.3,  unit: 'cm', confidence: 93, landmarkKeys: ['mid'] },
+      { key: 'Upper arm circ.', value: 28.6, unit: 'cm', confidence: 91, landmarkKeys: ['proximal'] },
+      { key: 'Forearm circ.',   value: 22.4, unit: 'cm', confidence: 89, landmarkKeys: ['distal'] },
+      { key: 'Olecranon depth', value: 4.1,  unit: 'cm', confidence: 87, landmarkKeys: ['mid'] },
+    ]
+  }
+  // Default → Forearm
+  return [
+    { key: 'Total length',        value: 26.1, unit: 'cm', confidence: 92, landmarkKeys: ['proximal', 'distal'] },
+    { key: 'Proximal width',      value: 8.2,  unit: 'cm', confidence: 90, landmarkKeys: ['proximal'] },
+    { key: 'Distal width',        value: 6.1,  unit: 'cm', confidence: 91, landmarkKeys: ['distal'] },
+    { key: 'Mid circumference',   value: 22.8, unit: 'cm', confidence: 89, landmarkKeys: ['mid'] },
+    { key: 'Wrist circumference', value: 16.4, unit: 'cm', confidence: 88, landmarkKeys: ['distal'] },
+  ]
+}
 
 interface Props {
   orthoCase: OrthoCase | null
@@ -128,10 +166,14 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
   // Recalculate measurements based on landmark drags
   function getAdjustedMeasurements(): Measurement[] {
     if (!c) return []
-    // If no edits, return original
-    if (!hasLandmarkEdits) return c.measurements
+    // Fall back to anatomical defaults when no measurements are stored yet
+    const base: Measurement[] = (c.measurements && c.measurements.length > 0)
+      ? c.measurements
+      : getDefaultMeasurements(c.bodyPart)
+    // If no landmark edits, return base as-is
+    if (!hasLandmarkEdits) return base
 
-    return c.measurements.map(m => {
+    return base.map(m => {
       // Find matching landmarks that affect this measurement
       if (m.key.toLowerCase().includes('length') && landmarks.proximal && landmarks.distal) {
         // Map length to Y distance
@@ -456,47 +498,30 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
         {activeTab === 'manufacturing' && (
           <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
             
-            {/* Visual 3D Cast Wireframe mesh */}
+            {/* Interactive 3D Cast Visualizer */}
             <div style={{
-              background: '#0F172A', borderRadius: 8, border: '1px solid #1E2937',
-              height: 180, display: 'flex', flexDirection: 'column',
-              alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden'
+              background: '#070A13', borderRadius: 8, border: '1px solid #1E2937',
+              position: 'relative', overflow: 'hidden'
             }}>
-              
-              {/* Mesh drawing representing the cast contour */}
-              <svg width="100%" height="100%" viewBox="0 0 100 100" style={{ maxWidth: 140 }}>
-                {/* Arm wireframe */}
-                <path d="M 35 15 C 33 30, 30 50, 36 85 C 42 88, 58 88, 64 85 C 70 50, 67 30, 65 15 Z" 
-                  fill="none" stroke="#334155" strokeWidth="0.8" />
-                
-                {/* Cast shell colored */}
-                <path d="M 34 22 C 32 35, 29 50, 35 80 C 40 83, 60 83, 65 80 C 71 50, 68 35, 66 22 Z" 
-                  fill="none" 
-                  stroke={castColor === 'Deep Violet' ? '#818CF8' : castColor === 'Neon Teal' ? '#2DD4BF' : castColor === 'Carbon Black' ? '#475569' : '#E2E8F0'} 
-                  strokeWidth={thickness} 
-                  strokeDasharray={ventPattern === 'Honeycomb' ? '1.5,1.5' : ventPattern === 'Circular mesh' ? '3,1' : '5,2.5'}
-                />
-
-                {/* LiDAR Sweep indicators */}
-                {isLidar && (
-                  <g stroke="#0ea5e9" strokeWidth="0.2" opacity="0.3" strokeDasharray="1,1">
-                    <line x1="10" y1="10" x2="35" y2="22"/>
-                    <line x1="90" y1="10" x2="65" y2="22"/>
-                    <line x1="10" y1="90" x2="35" y2="80"/>
-                    <line x1="90" y1="90" x2="65" y2="80"/>
-                  </g>
-                )}
-
-                <text x="50" y="93" font-size="4.5" fill="#94A3B8" font-family="monospace" text-anchor="middle">
-                  {ventPattern.toUpperCase()} ({thickness.toFixed(1)}mm)
-                </text>
-              </svg>
-
-              {/* Devices tag */}
+              <Cast3DVisualizer
+                castColor={castColor}
+                ventPattern={ventPattern}
+                thickness={thickness}
+                isLidar={!!isLidar}
+              />
+              {/* Drag hint */}
+              <div style={{
+                position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
+                fontSize: 9, fontFamily: 'var(--mono)',
+                color: '#475569', pointerEvents: 'none', whiteSpace: 'nowrap'
+              }}>
+                ↔ Drag to rotate · {ventPattern} ({thickness.toFixed(1)}mm)
+              </div>
+              {/* LiDAR / 2D badge */}
               <div style={{
                 position: 'absolute', top: 8, right: 8,
                 fontSize: 9, fontFamily: 'var(--mono)',
-                background: isLidar ? 'var(--lidar-bg)' : 'rgba(255,255,255,0.05)', 
+                background: isLidar ? 'var(--lidar-bg)' : 'rgba(255,255,255,0.05)',
                 color: isLidar ? 'var(--lidar-blue)' : '#94A3B8',
                 border: `1px solid ${isLidar ? 'var(--lidar-bdr)' : 'rgba(255,255,255,0.1)'}`,
                 padding: '2px 6px', borderRadius: 4

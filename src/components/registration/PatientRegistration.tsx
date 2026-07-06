@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { OrthoCase } from '../../types'
 
 interface Props {
-  onRegister: (data: Omit<OrthoCase, 'id' | 'submittedAt' | 'images' | 'measurements' | 'overallQuality' | 'status' | 'doctorName'>) => void
+  onRegister: (data: Omit<OrthoCase, 'id' | 'submittedAt' | 'images' | 'measurements' | 'overallQuality' | 'status' | 'doctorName'>) => Promise<void>
   onCancel: () => void
 }
 
@@ -18,8 +18,9 @@ export default function PatientRegistration({ onRegister, onCancel }: Props) {
   const [swellingStatus, setSwellingStatus] = useState('Moderate')
   const [consent, setConsent] = useState(false)
   const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!name || !age || !diagnosis) {
       setError('Please fill in all mandatory fields (Name, Age, Diagnosis).')
@@ -30,18 +31,24 @@ export default function PatientRegistration({ onRegister, onCancel }: Props) {
       return
     }
     setError('')
-    onRegister({
-      patientName: name,
-      patientAge: parseInt(age) || 30,
-      patientGender: gender,
-      bodyPart,
-      side,
-      scanPurpose,
-      diagnosis,
-      mobilityStatus,
-      swellingStatus,
-      doctorNotes: ''
-    })
+    setSubmitting(true)
+    try {
+      await onRegister({
+        patientName: name,
+        patientAge: parseInt(age) || 30,
+        patientGender: gender,
+        bodyPart,
+        side,
+        scanPurpose,
+        diagnosis,
+        mobilityStatus,
+        swellingStatus,
+        doctorNotes: ''
+      })
+    } catch (err: any) {
+      setError(err.message || 'Failed to register patient in Supabase. Check database schema.')
+      setSubmitting(false)
+    }
   }
 
   const groupStyle: React.CSSProperties = {
@@ -264,18 +271,19 @@ export default function PatientRegistration({ onRegister, onCancel }: Props) {
           </button>
           <button
             type="submit"
+            disabled={submitting}
             style={{
               padding: '8px 20px',
               borderRadius: 'var(--r)',
               border: 'none',
-              background: 'var(--accent)',
+              background: submitting ? 'var(--accent-bdr)' : 'var(--accent)',
               color: '#fff',
-              cursor: 'pointer',
+              cursor: submitting ? 'not-allowed' : 'pointer',
               fontWeight: 600,
               boxShadow: '0 2px 4px rgba(99,102,241,0.2)'
             }}
           >
-            Proceed to Guided Scan
+            {submitting ? 'Registering Patient...' : 'Register Patient (Send to Mobile Scan)'}
           </button>
         </div>
       </form>
