@@ -8,6 +8,7 @@ import Login from './pages/Login'
 import PatientRegistration from './components/registration/PatientRegistration'
 import DeviceDiagnostics from './components/devices/DeviceDiagnostics'
 import AuditTrail from './components/audit/AuditTrail'
+import AIRLManager from './components/analytics/AIRLManager'
 import { fetchCases, writeAuditLog, saveNewCase } from './data/api'
 import { supabase } from './data/supabase'
 
@@ -245,6 +246,10 @@ export default function App() {
 
           {activeView === 'audit' && (
             <AuditTrail />
+          )}
+
+          {activeView === 'analytics' && (
+            <AIRLManager />
           )}
 
           {/* Session Expiry Warning Card */}

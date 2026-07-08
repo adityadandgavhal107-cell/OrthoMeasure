@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../services/supabase_service.dart';
 import 'scan_screen.dart';
@@ -187,7 +187,7 @@ class _CaseCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: const Color(0xFF111827),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: accentColor.withOpacity(0.25)),
+        border: Border.all(color: accentColor.withValues(alpha: 0.25)),
       ),
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
@@ -226,9 +226,9 @@ class _CaseCard extends StatelessWidget {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: statusColor.withOpacity(0.12),
+                      color: statusColor.withValues(alpha: 0.12),
                       borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: statusColor.withOpacity(0.4)),
+                      border: Border.all(color: statusColor.withValues(alpha: 0.4)),
                     ),
                     child: Text(
                       isRescan ? 'RE-SCAN' : 'PENDING',
@@ -279,7 +279,7 @@ class _CaseCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.08),
+        color: color.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Row(

@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import '../services/supabase_service.dart';
 import 'case_list_screen.dart';
 
@@ -72,7 +72,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   decoration: BoxDecoration(
                     color: const Color(0xFF1E1B4B),
                     borderRadius: BorderRadius.circular(18),
-                    border: Border.all(color: const Color(0xFF6366F1).withOpacity(0.4)),
+                    border: Border.all(color: const Color(0xFF6366F1).withValues(alpha: 0.4)),
                   ),
                   child: const Icon(Icons.biotech_outlined, size: 38, color: Color(0xFF6366F1)),
                 ),

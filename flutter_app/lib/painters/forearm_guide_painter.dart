@@ -43,21 +43,21 @@ class ForearmGuidePainter extends CustomPainter {
     final color = _borderColor;
 
     final borderPaint = Paint()
-      ..color = color.withOpacity(0.85)
+      ..color = color.withValues(alpha: 0.85)
       ..strokeWidth = 2.5
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
     final fillPaint = Paint()
-      ..color = color.withOpacity(0.08)
+      ..color = color.withValues(alpha: 0.08)
       ..style = PaintingStyle.fill;
 
     final dotPaint = Paint()
-      ..color = color.withOpacity(0.9)
+      ..color = color.withValues(alpha: 0.9)
       ..style = PaintingStyle.fill;
 
     final shadowPaint = Paint()
-      ..color = color.withOpacity(0.18)
+      ..color = color.withValues(alpha: 0.18)
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
 
     // ── 1. Determine silhouette shape based on view angle ──────────────────────
@@ -86,7 +86,7 @@ class ForearmGuidePainter extends CustomPainter {
     ];
 
     final labelStyle = TextStyle(
-      color: color.withOpacity(0.9),
+      color: color.withValues(alpha: 0.9),
       fontSize: 9,
       fontWeight: FontWeight.bold,
       letterSpacing: 1.2,
@@ -96,7 +96,7 @@ class ForearmGuidePainter extends CustomPainter {
       // Outer ring (pulsing when score is good)
       if (validationScore > 0.6) {
         final pulsed = Paint()
-          ..color = color.withOpacity(0.3 * (1 - pulsePhase))
+          ..color = color.withValues(alpha: 0.3 * (1 - pulsePhase))
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.5;
         canvas.drawCircle(pos, 10 + 8 * pulsePhase, pulsed);
@@ -104,7 +104,10 @@ class ForearmGuidePainter extends CustomPainter {
 
       // Solid dot
       canvas.drawCircle(pos, 5, dotPaint);
-      canvas.drawCircle(pos, 5, borderPaint..color = Colors.white.withOpacity(0.7)..strokeWidth = 1.5);
+      canvas.drawCircle(pos, 5,
+          borderPaint
+            ..color = Colors.white.withValues(alpha: 0.7)
+            ..strokeWidth = 1.5);
 
       // Label background pill
       final textPainter = TextPainter(
@@ -121,8 +124,10 @@ class ForearmGuidePainter extends CustomPainter {
         ),
         const Radius.circular(4),
       );
-      canvas.drawRRect(pillRect, Paint()..color = Colors.black.withOpacity(0.55));
-      textPainter.paint(canvas, Offset(pos.dx + 32 - textPainter.width / 2, pos.dy - textPainter.height / 2));
+      canvas.drawRRect(
+          pillRect, Paint()..color = Colors.black.withValues(alpha: 0.55));
+      textPainter.paint(canvas,
+          Offset(pos.dx + 32 - textPainter.width / 2, pos.dy - textPainter.height / 2));
     }
 
     // ── 4. Corner tick marks (like a camera viewfinder) ──────────────────────
@@ -131,7 +136,7 @@ class ForearmGuidePainter extends CustomPainter {
     // ── 5. Pulse ring around full guide when auto-capture pending ─────────────
     if (validationScore >= 1.0 && !isCapturing) {
       final pulseRingPaint = Paint()
-        ..color = const Color(0xFF10B981).withOpacity(0.4 * (1 - pulsePhase))
+        ..color = const Color(0xFF10B981).withValues(alpha: 0.4 * (1 - pulsePhase))
         ..strokeWidth = 3
         ..style = PaintingStyle.stroke;
       canvas.drawRRect(
@@ -167,7 +172,7 @@ class ForearmGuidePainter extends CustomPainter {
 
   void _drawCornerTicks(Canvas canvas, double w, double h, Color color) {
     final tickPaint = Paint()
-      ..color = color.withOpacity(0.7)
+      ..color = color.withValues(alpha: 0.7)
       ..strokeWidth = 2.0
       ..strokeCap = StrokeCap.square
       ..style = PaintingStyle.stroke;

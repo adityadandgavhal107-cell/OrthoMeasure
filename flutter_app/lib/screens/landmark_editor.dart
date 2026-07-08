@@ -1,6 +1,8 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import '../services/supabase_service.dart';
 
 class LandmarkEditor extends StatefulWidget {
@@ -39,6 +41,7 @@ class _LandmarkEditorState extends State<LandmarkEditor>
   void initState() {
     super.initState();
     _initializeLandmarks();
+    _loadAndApplyAIPredictions();
     _loadImageBytes();
 
     _enterController = AnimationController(
@@ -94,6 +97,133 @@ class _LandmarkEditorState extends State<LandmarkEditor>
         'mid': {'label': 'Olecranon', 'x': 50.0, 'y': 52.0, 'color': 0xFFF59E0B},
         'distal': {'label': 'Prox. Forearm', 'x': 50.0, 'y': 75.0, 'color': 0xFF10B981},
       };
+    }
+  }
+
+  Future<void> _loadAndApplyAIPredictions() async {
+    try {
+      final res = await http.get(Uri.parse(
+          'https://ydegxkfpzqfwcrfhcjge.supabase.co/storage/v1/object/public/scans/rl_model_data.json'));
+      if (res.statusCode != 200) return;
+
+      final data = json.decode(res.body) as Map<String, dynamic>;
+      final weights = data['weights'] as Map<String, dynamic>;
+
+      final w1 = (weights['W1'] as List).map((l) => (l as List).map((v) => double.parse(v.toString())).toList()).toList();
+      final b1 = ((weights['b1'] as List)[0] as List).map((v) => double.parse(v.toString())).toList();
+      final w2 = (weights['W2'] as List).map((l) => (l as List).map((v) => double.parse(v.toString())).toList()).toList();
+      final b2 = ((weights['b2'] as List)[0] as List).map((v) => double.parse(v.toString())).toList();
+      final w3 = (weights['W3'] as List).map((l) => (l as List).map((v) => double.parse(v.toString())).toList()).toList();
+      final b3 = ((weights['b3'] as List)[0] as List).map((v) => double.parse(v.toString())).toList();
+
+      // Build state vector (23)
+      final state = List<double>.filled(23, 0.0);
+      
+      final age = widget.orthoCase['patientAge'] ?? 35.0;
+      state[0] = age / 100.0;
+
+      final gender = widget.orthoCase['patientGender'] ?? 'M';
+      if (gender == 'M') {
+        state[1] = 1.0;
+      } else if (gender == 'F') {
+        state[2] = 1.0;
+      } else {
+        state[3] = 1.0;
+      }
+
+      final side = widget.orthoCase['side'] ?? 'Left';
+      if (side == 'Left') {
+        state[4] = 1.0;
+      } else {
+        state[5] = 1.0;
+      }
+
+      final part = widget.orthoCase['bodyPart'] ?? 'Forearm';
+      if (part == 'Forearm') {
+        state[6] = 1.0;
+      } else if (part == 'Wrist') {
+        state[7] = 1.0;
+      } else if (part == 'Ankle') {
+        state[8] = 1.0;
+      } else {
+        state[9] = 1.0;
+      }
+
+      final mobility = widget.orthoCase['mobilityStatus'] ?? 'Normal';
+      if (mobility == 'Normal') {
+        state[10] = 1.0;
+      } else if (mobility == 'Limited') {
+        state[11] = 1.0;
+      } else {
+        state[12] = 1.0;
+      }
+
+      final swelling = widget.orthoCase['swellingStatus'] ?? 'Normal';
+      if (swelling == 'Normal') {
+        state[13] = 1.0;
+      } else if (swelling == 'Mild') {
+        state[14] = 1.0;
+      } else if (swelling == 'Moderate') {
+        state[15] = 1.0;
+      } else {
+        state[16] = 1.0;
+      }
+
+      final angles = ['Front', 'Back', 'Left', 'Right', '45° Left', '45° Right'];
+      final angleIdx = angles.indexOf(widget.angle);
+      if (angleIdx != -1) {
+        state[17 + angleIdx] = 1.0;
+      }
+
+      // FC1 ReLU
+      final h1 = List<double>.filled(32, 0.0);
+      for (int j = 0; j < 32; j++) {
+        double sum = b1[j];
+        for (int i = 0; i < 23; i++) {
+          sum += state[i] * w1[i][j];
+        }
+        h1[j] = sum > 0.0 ? sum : 0.0;
+      }
+
+      // FC2 ReLU
+      final h2 = List<double>.filled(16, 0.0);
+      for (int j = 0; j < 16; j++) {
+        double sum = b2[j];
+        for (int i = 0; i < 32; i++) {
+          sum += h1[i] * w2[i][j];
+        }
+        h2[j] = sum > 0.0 ? sum : 0.0;
+      }
+
+      // Output FC3
+      final offsets = List<double>.filled(6, 0.0);
+      for (int j = 0; j < 6; j++) {
+        double sum = b3[j];
+        for (int i = 0; i < 16; i++) {
+          sum += h2[i] * w3[i][j];
+        }
+        offsets[j] = sum;
+      }
+
+      if (mounted) {
+        setState(() {
+          final keys = ['proximal', 'mid', 'distal'];
+          for (int i = 0; i < 3; i++) {
+            final k = keys[i];
+            final double baseValX = _landmarks[k]!['x'];
+            final double baseValY = _landmarks[k]!['y'];
+            
+            final double newX = (baseValX + offsets[i * 2]).clamp(5.0, 95.0);
+            final double newY = (baseValY + offsets[i * 2 + 1]).clamp(5.0, 95.0);
+            
+            _landmarks[k]!['x'] = double.parse(newX.toStringAsFixed(1));
+            _landmarks[k]!['y'] = double.parse(newY.toStringAsFixed(1));
+          }
+        });
+        debugPrint('AI Reinforcement Learning landmark offsets applied successfully.');
+      }
+    } catch (e) {
+      debugPrint('Failed to run AI landmark inference: $e');
     }
   }
 
@@ -173,9 +303,9 @@ class _LandmarkEditorState extends State<LandmarkEditor>
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
+            const Text(
               'Adjust Landmarks',
-              style: const TextStyle(color: Colors.white, fontSize: 15),
+              style: TextStyle(color: Colors.white, fontSize: 15),
             ),
             Text(
               widget.angle,
@@ -313,8 +443,8 @@ class _LandmarkEditorState extends State<LandmarkEditor>
                                                         boxShadow: [
                                                           BoxShadow(
                                                             color: color
-                                                                .withOpacity(
-                                                                    0.55),
+                                                                .withValues(
+                                                                    alpha: 0.55),
                                                             blurRadius:
                                                                 isActive
                                                                     ? 14
@@ -352,8 +482,8 @@ class _LandmarkEditorState extends State<LandmarkEditor>
                                                                 .circular(5),
                                                         border: Border.all(
                                                             color: color
-                                                                .withOpacity(
-                                                                    0.6),
+                                                                .withValues(
+                                                                    alpha: 0.6),
                                                             width: 1),
                                                       ),
                                                       child: Text(

@@ -55,6 +55,7 @@ class _ScanScreenState extends State<ScanScreen>
   // ── Camera ────────────────────────────────────────────────────────────────
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
+  bool _isProcessingFrame = false;
 
   // ── Workflow state ────────────────────────────────────────────────────────
   int _currentStep = 0;
@@ -112,6 +113,9 @@ class _ScanScreenState extends State<ScanScreen>
   void dispose() {
     _analysisTimer?.cancel();
     _autoCaptureTimer?.cancel();
+    if (_cameraController != null && _cameraController!.value.isStreamingImages) {
+      _cameraController!.stopImageStream();
+    }
     _cameraController?.dispose();
     _pulseController.dispose();
     _countdownController.dispose();
@@ -171,64 +175,169 @@ class _ScanScreenState extends State<ScanScreen>
       await _cameraController!.initialize();
       if (mounted) {
         setState(() => _isCameraInitialized = true);
-        _startAnalysisLoop();
+        _startFrameAnalysisStream();
       }
     } catch (e) {
       debugPrint('Camera init error: $e');
     }
   }
 
-  // ── Simulated real-time analysis ──────────────────────────────────────────
-  /// In production replace with ML Kit / OpenCV frame analysis.
-  /// This simulation ramps the score over a few seconds so the UX is correct.
-  void _startAnalysisLoop() {
-    _analysisTimer?.cancel();
+  // ── Real-time camera frame stream analysis (Skin & Alignment Detection) ────
+  void _startFrameAnalysisStream() {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+
     _stableFrameCount = 0;
     _validationScore = 0.0;
+    _isProcessingFrame = false;
 
-    // Simulate checks progressing over ~2.5 s
-    _analysisTimer = Timer.periodic(const Duration(milliseconds: 220), (t) {
-      if (!mounted || _isCapturing || _isNavigating) {
-        return;
-      }
+    _cameraController!.startImageStream((CameraImage image) {
+      if (!mounted || _isCapturing || _isNavigating || _isProcessingFrame) return;
 
-      // Simulate: score climbs at ~8% per tick until 1.0
-      // In production: run actual checks (brightness, blur, silhouette overlap)
-      final nextScore = (_validationScore + 0.06).clamp(0.0, 1.0);
-      _stableFrameCount = nextScore >= 1.0 ? _stableFrameCount + 1 : 0;
-
-      String msg;
-      Color col;
-
-      if (nextScore < 0.35) {
-        msg = 'Position the forearm inside the guide frame';
-        col = const Color(0xFFEF4444);
-      } else if (nextScore < 0.65) {
-        msg = 'Good — keep the limb still and centred…';
-        col = const Color(0xFFF59E0B);
-      } else if (nextScore < 1.0) {
-        msg = 'Almost ready — hold steady…';
-        col = const Color(0xFF34D399);
-      } else {
-        msg = '✓ Aligned — auto-capturing…';
-        col = const Color(0xFF10B981);
-      }
-
-      setState(() {
-        _validationScore = nextScore;
-        _statusMessage = msg;
-        _statusColor = col;
-      });
-
-      if (_stableFrameCount >= _kStableFramesRequired && !_isCapturing && !_isNavigating) {
-        t.cancel();
-        _triggerAutoCapture();
-      }
+      _isProcessingFrame = true;
+      _analyzeFrame(image);
     });
   }
 
+  void _analyzeFrame(CameraImage image) {
+    try {
+      final width = image.width;
+      final height = image.height;
+
+      if (image.planes.isEmpty) {
+        _isProcessingFrame = false;
+        return;
+      }
+
+      final yPlane = image.planes[0];
+      final yBytes = yPlane.bytes;
+
+      // Calculate average brightness from sub-sampled pixels
+      int totalY = 0;
+      int sampleCountY = 0;
+      for (int i = 0; i < yBytes.length; i += 120) {
+        totalY += yBytes[i];
+        sampleCountY++;
+      }
+      final double avgLuminance = sampleCountY > 0 ? totalY / sampleCountY : 128.0;
+
+      // Skin detection & Centering check
+      int skinPixelsInCenter = 0;
+      int skinPixelsLeft = 0;
+      int skinPixelsRight = 0;
+
+      final hasUVPlanes = image.planes.length >= 3;
+      final uBytes = hasUVPlanes ? image.planes[1].bytes : null;
+      final vBytes = hasUVPlanes ? image.planes[2].bytes : null;
+
+      final uPixelStride = hasUVPlanes ? (image.planes[1].bytesPerPixel ?? 1) : 1;
+      final vPixelStride = hasUVPlanes ? (image.planes[2].bytesPerPixel ?? 1) : 1;
+
+      final uRowStride = hasUVPlanes ? image.planes[1].bytesPerRow : (width ~/ 2);
+      final vRowStride = hasUVPlanes ? image.planes[2].bytesPerRow : (width ~/ 2);
+
+      // Subsample grid of pixels inside the bounds
+      final rowStep = height ~/ 14;
+      final colStep = width ~/ 14;
+
+      for (int r = height ~/ 5; r < (height * 4) ~/ 5; r += rowStep) {
+        for (int c = width ~/ 6; c < (width * 5) ~/ 6; c += colStep) {
+          int yVal = yBytes[r * width + c];
+          int cbVal = 128;
+          int crVal = 128;
+
+          if (hasUVPlanes && uBytes != null && vBytes != null) {
+            int uvRow = r ~/ 2;
+            int uvCol = c ~/ 2;
+
+            int uIdx = uvRow * uRowStride + uvCol * uPixelStride;
+            int vIdx = uvRow * vRowStride + uvCol * vPixelStride;
+
+            if (uIdx < uBytes.length) cbVal = uBytes[uIdx];
+            if (vIdx < vBytes.length) crVal = vBytes[vIdx];
+          }
+
+          // Skin color range checks (Cb in [77, 127], Cr in [133, 173])
+          bool isSkin = cbVal >= 77 && cbVal <= 127 && crVal >= 133 && crVal <= 173 && yVal >= 40 && yVal <= 245;
+
+          if (isSkin) {
+            double colPct = c / width;
+            if (colPct >= 0.35 && colPct <= 0.65) {
+              skinPixelsInCenter++;
+            } else if (colPct < 0.35) {
+              skinPixelsLeft++;
+            } else {
+              skinPixelsRight++;
+            }
+          }
+        }
+      }
+
+      double nextScore = _validationScore;
+      String msg = _statusMessage;
+      Color col = _statusColor;
+
+      int totalSkinPixels = skinPixelsInCenter + skinPixelsLeft + skinPixelsRight;
+
+      if (avgLuminance < 35) {
+        nextScore = (nextScore - 0.12).clamp(0.0, 1.0);
+        msg = '⚠️ Ambient light is too low (increase brightness)';
+        col = const Color(0xFFEF4444);
+      } else if (avgLuminance > 242) {
+        nextScore = (nextScore - 0.12).clamp(0.0, 1.0);
+        msg = '⚠️ Ambient light is too high (avoid overexposure)';
+        col = const Color(0xFFEF4444);
+      } else if (totalSkinPixels < 6) {
+        nextScore = (nextScore - 0.08).clamp(0.0, 1.0);
+        msg = 'Forearm/skin not detected. Align limb inside guide';
+        col = const Color(0xFFEF4444);
+      } else if (skinPixelsInCenter < (skinPixelsLeft + skinPixelsRight) * 0.45) {
+        nextScore = (nextScore - 0.05).clamp(0.0, 1.0);
+        if (skinPixelsLeft > skinPixelsRight) {
+          msg = '← Align arm in center (move camera Left)';
+        } else {
+          msg = '→ Align arm in center (move camera Right)';
+        }
+        col = const Color(0xFFF59E0B);
+      } else {
+        // Skin is detected and centered!
+        nextScore = (nextScore + 0.12).clamp(0.0, 1.0);
+
+        if (nextScore < 0.4) {
+          msg = 'Limb detected. Keep steady…';
+          col = const Color(0xFFF59E0B);
+        } else if (nextScore < 0.85) {
+          msg = 'Limb aligned — hold camera still…';
+          col = const Color(0xFF34D399);
+        } else {
+          msg = '✓ Aligned — auto-capturing…';
+          col = const Color(0xFF10B981);
+        }
+      }
+
+      _stableFrameCount = nextScore >= 1.0 ? _stableFrameCount + 1 : 0;
+
+      if (mounted) {
+        setState(() {
+          _validationScore = nextScore;
+          _statusMessage = msg;
+          _statusColor = col;
+        });
+      }
+
+      if (_stableFrameCount >= _kStableFramesRequired && !_isCapturing && !_isNavigating) {
+        if (_cameraController != null && _cameraController!.value.isStreamingImages) {
+          _cameraController!.stopImageStream();
+        }
+        _triggerAutoCapture();
+      }
+    } catch (e, stack) {
+      debugPrint('Error analyzing frame: $e\n$stack');
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
   void _resetAnalysis() {
-    _analysisTimer?.cancel();
     _autoCaptureTimer?.cancel();
     _countdownController.reset();
     setState(() {
@@ -239,7 +348,7 @@ class _ScanScreenState extends State<ScanScreen>
       _isCapturing = false;
       _isNavigating = false;
     });
-    _startAnalysisLoop();
+    _startFrameAnalysisStream();
   }
 
   void _triggerAutoCapture() {
@@ -262,6 +371,9 @@ class _ScanScreenState extends State<ScanScreen>
     setState(() => _isCapturing = true);
 
     try {
+      if (_cameraController!.value.isStreamingImages) {
+        await _cameraController!.stopImageStream();
+      }
       final XFile raw = await _cameraController!.takePicture();
       final File imageFile = File(raw.path);
 
@@ -411,7 +523,7 @@ class _ScanScreenState extends State<ScanScreen>
                         radius: 0.9,
                         colors: [
                           Colors.transparent,
-                          Colors.black.withOpacity(0.45),
+                          Colors.black.withValues(alpha: 0.45),
                         ],
                       ),
                     ),
@@ -472,10 +584,10 @@ class _ScanScreenState extends State<ScanScreen>
                         padding: const EdgeInsets.symmetric(
                             horizontal: 14, vertical: 10),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.72),
+                          color: Colors.black.withValues(alpha: 0.72),
                           borderRadius: BorderRadius.circular(10),
                           border: Border.all(
-                              color: Colors.white.withOpacity(0.12)),
+                              color: Colors.white.withValues(alpha: 0.12)),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -515,10 +627,10 @@ class _ScanScreenState extends State<ScanScreen>
                         padding: const EdgeInsets.symmetric(
                             horizontal: 16, vertical: 10),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.80),
+                          color: Colors.black.withValues(alpha: 0.80),
                           borderRadius: BorderRadius.circular(40),
                           border: Border.all(
-                              color: _statusColor.withOpacity(0.5),
+                              color: _statusColor.withValues(alpha: 0.5),
                               width: 1.5),
                         ),
                         child: Row(
@@ -532,11 +644,11 @@ class _ScanScreenState extends State<ScanScreen>
                                 height: 10,
                                 decoration: BoxDecoration(
                                   shape: BoxShape.circle,
-                                  color: _statusColor.withOpacity(
-                                      0.5 + 0.5 * _pulseController.value),
+                                  color: _statusColor.withValues(
+                                      alpha: 0.5 + 0.5 * _pulseController.value),
                                   boxShadow: [
                                     BoxShadow(
-                                      color: _statusColor.withOpacity(0.6),
+                                      color: _statusColor.withValues(alpha: 0.6),
                                       blurRadius: 6,
                                     ),
                                   ],

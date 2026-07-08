@@ -27,6 +27,7 @@ export default function SideRail({ activeView, activeFilter, counts, onChangeVie
 
   const secondary: RailItem[] = [
     { icon: '⊕', label: 'New Patient Scan', view: 'register' },
+    { icon: '🧠', label: 'AI Reinforcement Center', view: 'analytics' },
     { icon: '▣', label: 'Devices diagnostics', view: 'devices' },
     { icon: '▤', label: 'HIPAA Audit log', view: 'audit' }
   ]
