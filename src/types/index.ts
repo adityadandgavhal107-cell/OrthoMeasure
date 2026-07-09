@@ -12,6 +12,7 @@ export interface Measurement {
   unit: string
   confidence: number
   landmarkKeys?: string[] // which landmarks affect this measurement
+  manualValue?: number // Ground truth manually entered value
 }
 
 export interface ScanImage {

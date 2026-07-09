@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../painters/forearm_guide_painter.dart';
 import '../services/supabase_service.dart';
@@ -56,6 +58,9 @@ class _ScanScreenState extends State<ScanScreen>
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
   bool _isProcessingFrame = false;
+  DateTime _lastAnalysisTime = DateTime.now();
+
+  final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
 
   // ── Workflow state ────────────────────────────────────────────────────────
   int _currentStep = 0;
@@ -73,8 +78,8 @@ class _ScanScreenState extends State<ScanScreen>
   /// How many consecutive frames passed all checks
   int _stableFrameCount = 0;
 
-  /// Frames needed before auto-capture fires (≈ 600ms at 2fps analysis)
-  static const int _kStableFramesRequired = 3; // 3 × ~200ms = ~600ms
+  /// Frames needed before auto-capture fires
+  static const int _kStableFramesRequired = 10; // Increased to prevent premature capture
 
   Timer? _analysisTimer;
   Timer? _autoCaptureTimer;
@@ -113,6 +118,7 @@ class _ScanScreenState extends State<ScanScreen>
   void dispose() {
     _analysisTimer?.cancel();
     _autoCaptureTimer?.cancel();
+    _poseDetector.close();
     if (_cameraController != null && _cameraController!.value.isStreamingImages) {
       _cameraController!.stopImageStream();
     }
@@ -169,6 +175,9 @@ class _ScanScreenState extends State<ScanScreen>
       backCam,
       ResolutionPreset.high,
       enableAudio: false,
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888,
     );
 
     try {
@@ -198,119 +207,114 @@ class _ScanScreenState extends State<ScanScreen>
     });
   }
 
-  void _analyzeFrame(CameraImage image) {
+  Future<void> _analyzeFrame(CameraImage image) async {
     try {
-      final width = image.width;
-      final height = image.height;
+      final now = DateTime.now();
+      if (now.difference(_lastAnalysisTime).inMilliseconds < 350) {
+        _isProcessingFrame = false;
+        return;
+      }
+      _lastAnalysisTime = now;
+
+      if (_cameraController == null) return;
+
+      final camera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+
+      final sensorOrientation = camera.sensorOrientation;
+      InputImageRotation? rotation;
+      if (Platform.isIOS) {
+        rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
+      } else if (Platform.isAndroid) {
+        var rotationCompensation = 0;
+        switch (_cameraController!.value.deviceOrientation) {
+          case DeviceOrientation.portraitUp: rotationCompensation = 0; break;
+          case DeviceOrientation.landscapeLeft: rotationCompensation = 90; break;
+          case DeviceOrientation.portraitDown: rotationCompensation = 180; break;
+          case DeviceOrientation.landscapeRight: rotationCompensation = 270; break;
+        }
+        if (camera.lensDirection == CameraLensDirection.front) {
+          rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
+        } else {
+          rotationCompensation = (sensorOrientation - rotationCompensation + 360) % 360;
+        }
+        rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
+      }
+
+      if (rotation == null) {
+        _isProcessingFrame = false;
+        return;
+      }
+
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      if (format == null ||
+          (Platform.isAndroid && format != InputImageFormat.nv21) ||
+          (Platform.isIOS && format != InputImageFormat.bgra8888)) {
+        _isProcessingFrame = false;
+        return;
+      }
 
       if (image.planes.isEmpty) {
         _isProcessingFrame = false;
         return;
       }
 
-      final yPlane = image.planes[0];
-      final yBytes = yPlane.bytes;
-
-      // Calculate average brightness from sub-sampled pixels
-      int totalY = 0;
-      int sampleCountY = 0;
-      for (int i = 0; i < yBytes.length; i += 120) {
-        totalY += yBytes[i];
-        sampleCountY++;
+      final WriteBuffer allBytes = WriteBuffer();
+      for (final Plane plane in image.planes) {
+        allBytes.putUint8List(plane.bytes);
       }
-      final double avgLuminance = sampleCountY > 0 ? totalY / sampleCountY : 128.0;
+      final bytes = allBytes.done().buffer.asUint8List();
 
-      // Skin detection & Centering check
-      int skinPixelsInCenter = 0;
-      int skinPixelsLeft = 0;
-      int skinPixelsRight = 0;
+      final inputImage = InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
+      );
 
-      final hasUVPlanes = image.planes.length >= 3;
-      final uBytes = hasUVPlanes ? image.planes[1].bytes : null;
-      final vBytes = hasUVPlanes ? image.planes[2].bytes : null;
-
-      final uPixelStride = hasUVPlanes ? (image.planes[1].bytesPerPixel ?? 1) : 1;
-      final vPixelStride = hasUVPlanes ? (image.planes[2].bytesPerPixel ?? 1) : 1;
-
-      final uRowStride = hasUVPlanes ? image.planes[1].bytesPerRow : (width ~/ 2);
-      final vRowStride = hasUVPlanes ? image.planes[2].bytesPerRow : (width ~/ 2);
-
-      // Subsample grid of pixels inside the bounds
-      final rowStep = height ~/ 14;
-      final colStep = width ~/ 14;
-
-      for (int r = height ~/ 5; r < (height * 4) ~/ 5; r += rowStep) {
-        for (int c = width ~/ 6; c < (width * 5) ~/ 6; c += colStep) {
-          int yVal = yBytes[r * width + c];
-          int cbVal = 128;
-          int crVal = 128;
-
-          if (hasUVPlanes && uBytes != null && vBytes != null) {
-            int uvRow = r ~/ 2;
-            int uvCol = c ~/ 2;
-
-            int uIdx = uvRow * uRowStride + uvCol * uPixelStride;
-            int vIdx = uvRow * vRowStride + uvCol * vPixelStride;
-
-            if (uIdx < uBytes.length) cbVal = uBytes[uIdx];
-            if (vIdx < vBytes.length) crVal = vBytes[vIdx];
-          }
-
-          // Skin color range checks (Cb in [77, 127], Cr in [133, 173])
-          bool isSkin = cbVal >= 77 && cbVal <= 127 && crVal >= 133 && crVal <= 173 && yVal >= 40 && yVal <= 245;
-
-          if (isSkin) {
-            double colPct = c / width;
-            if (colPct >= 0.35 && colPct <= 0.65) {
-              skinPixelsInCenter++;
-            } else if (colPct < 0.35) {
-              skinPixelsLeft++;
-            } else {
-              skinPixelsRight++;
-            }
-          }
-        }
-      }
+      final List<Pose> poses = await _poseDetector.processImage(inputImage);
 
       double nextScore = _validationScore;
       String msg = _statusMessage;
       Color col = _statusColor;
 
-      int totalSkinPixels = skinPixelsInCenter + skinPixelsLeft + skinPixelsRight;
-
-      if (avgLuminance < 35) {
-        nextScore = (nextScore - 0.12).clamp(0.0, 1.0);
-        msg = '⚠️ Ambient light is too low (increase brightness)';
+      if (poses.isEmpty) {
+        nextScore = (nextScore - 0.15).clamp(0.0, 1.0);
+        msg = 'Limb not detected. Align limb inside guide';
         col = const Color(0xFFEF4444);
-      } else if (avgLuminance > 242) {
-        nextScore = (nextScore - 0.12).clamp(0.0, 1.0);
-        msg = '⚠️ Ambient light is too high (avoid overexposure)';
-        col = const Color(0xFFEF4444);
-      } else if (totalSkinPixels < 6) {
-        nextScore = (nextScore - 0.08).clamp(0.0, 1.0);
-        msg = 'Forearm/skin not detected. Align limb inside guide';
-        col = const Color(0xFFEF4444);
-      } else if (skinPixelsInCenter < (skinPixelsLeft + skinPixelsRight) * 0.45) {
-        nextScore = (nextScore - 0.05).clamp(0.0, 1.0);
-        if (skinPixelsLeft > skinPixelsRight) {
-          msg = '← Align arm in center (move camera Left)';
-        } else {
-          msg = '→ Align arm in center (move camera Right)';
-        }
-        col = const Color(0xFFF59E0B);
       } else {
-        // Skin is detected and centered!
-        nextScore = (nextScore + 0.12).clamp(0.0, 1.0);
+        final pose = poses.first;
+        final leftWrist = pose.landmarks[PoseLandmarkType.leftWrist];
+        final rightWrist = pose.landmarks[PoseLandmarkType.rightWrist];
+        final leftElbow = pose.landmarks[PoseLandmarkType.leftElbow];
+        final rightElbow = pose.landmarks[PoseLandmarkType.rightElbow];
 
-        if (nextScore < 0.4) {
-          msg = 'Limb detected. Keep steady…';
+        final hasValidWrist = (leftWrist != null && leftWrist.likelihood > 0.6) || 
+                              (rightWrist != null && rightWrist.likelihood > 0.6);
+        final hasValidElbow = (leftElbow != null && leftElbow.likelihood > 0.6) || 
+                              (rightElbow != null && rightElbow.likelihood > 0.6);
+
+        if (!hasValidWrist || !hasValidElbow) {
+          nextScore = (nextScore - 0.10).clamp(0.0, 1.0);
+          msg = 'Ensure both wrist and elbow are visible';
           col = const Color(0xFFF59E0B);
-        } else if (nextScore < 0.85) {
-          msg = 'Limb aligned — hold camera still…';
-          col = const Color(0xFF34D399);
         } else {
-          msg = '✓ Aligned — auto-capturing…';
-          col = const Color(0xFF10B981);
+          nextScore = (nextScore + 0.15).clamp(0.0, 1.0);
+          if (nextScore < 0.4) {
+            msg = 'Limb detected. Keep steady…';
+            col = const Color(0xFFF59E0B);
+          } else if (nextScore < 0.85) {
+            msg = 'Limb aligned — hold camera still…';
+            col = const Color(0xFF34D399);
+          } else {
+            msg = '✓ Aligned — auto-capturing…';
+            col = const Color(0xFF10B981);
+          }
         }
       }
 
@@ -331,7 +335,7 @@ class _ScanScreenState extends State<ScanScreen>
         _triggerAutoCapture();
       }
     } catch (e, stack) {
-      debugPrint('Error analyzing frame: $e\n$stack');
+      debugPrint('Error analyzing frame: $e\\n$stack');
     } finally {
       _isProcessingFrame = false;
     }

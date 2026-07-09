@@ -37,8 +37,25 @@ export default function App() {
 
   // Load and refresh case counts
   useEffect(() => {
-    fetchCases('all').then(setCasesList)
+    fetchCases('all').then(cases => {
+      setCasesList(cases)
+      setSelected(prev => {
+        if (!prev) return null
+        return cases.find(c => c.id === prev.id) || prev
+      })
+    })
   }, [refreshKey, activeView])
+
+  // Real-time synchronization for cases
+  useEffect(() => {
+    if (!authed) return
+    const channel = supabase.channel('public:ortho_cases')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'ortho_cases' }, () => {
+        setRefreshKey(k => k + 1)
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [authed])
 
   // Track session timer countdown
   useEffect(() => {
@@ -204,7 +221,7 @@ export default function App() {
           {activeView === 'register' && (
             <PatientRegistration 
               onRegister={async (data) => {
-                const id = `OM-2024-${String(Math.floor(Math.random() * 900) + 100)}`
+                const id = `OM-${new Date().getFullYear()}-${crypto.randomUUID().split('-')[0].toUpperCase()}`
                 const newCase: OrthoCase = {
                   ...data,
                   id,

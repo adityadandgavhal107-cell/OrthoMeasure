@@ -36,7 +36,7 @@ function getDefaultMeasurements(bodyPart: string): Measurement[] {
   }
   // Default → Forearm
   return [
-    { key: 'Total length',        value: 26.1, unit: 'cm', confidence: 92, landmarkKeys: ['proximal', 'distal'] },
+    { key: 'Total length',        value: 25.0, unit: 'cm', confidence: 92, landmarkKeys: ['proximal', 'distal'] },
     { key: 'Proximal width',      value: 8.2,  unit: 'cm', confidence: 90, landmarkKeys: ['proximal'] },
     { key: 'Distal width',        value: 6.1,  unit: 'cm', confidence: 91, landmarkKeys: ['distal'] },
     { key: 'Mid circumference',   value: 22.8, unit: 'cm', confidence: 89, landmarkKeys: ['mid'] },
@@ -79,6 +79,8 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
   const [thickness, setThickness] = useState(3.5)
   const [castColor, setCastColor] = useState('Medical White')
   const [ventPattern, setVentPattern] = useState('Circular mesh')
+  const [manualEdits, setManualEdits] = useState<Record<string, number | undefined>>({})
+  const [isSavingManual, setIsSavingManual] = useState(false)
 
   // Re-initialize local states when case or image changes
   useEffect(() => {
@@ -94,6 +96,7 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
       setThickness(c.castThickness || 3.5)
       setCastColor(c.castColor || 'Medical White')
       setVentPattern(c.ventPattern || 'Circular mesh')
+      setManualEdits({})
     }
   }, [c])
 
@@ -166,22 +169,31 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
   // Recalculate measurements based on landmark drags
   function getAdjustedMeasurements(): Measurement[] {
     if (!c) return []
-    // Fall back to anatomical defaults when no measurements are stored yet
-    const base: Measurement[] = (c.measurements && c.measurements.length > 0)
-      ? c.measurements
-      : getDefaultMeasurements(c.bodyPart)
-    // If no landmark edits, return base as-is
-    if (!hasLandmarkEdits) return base
+    
+    // If no real measurements and no images yet, show nothing
+    if ((!c.measurements || c.measurements.length === 0) && (!c.images || c.images.length === 0)) {
+      return []
+    }
 
-    return base.map(m => {
+    // Always calculate from anatomical defaults so errors don't compound
+    const base: Measurement[] = getDefaultMeasurements(c.bodyPart)
+
+    // If no landmarks available, fall back to stored measurements or base
+    if (!landmarks || !landmarks.proximal || !landmarks.distal) {
+      return (c.measurements && c.measurements.length > 0) ? c.measurements : base
+    }
+
+    const aiAdjusted = base.map(m => {
       // Find matching landmarks that affect this measurement
       if (m.key.toLowerCase().includes('length') && landmarks.proximal && landmarks.distal) {
-        // Map length to Y distance
-        const baseDy = 60 // original mock distance (82 - 22)
-        const currentDy = landmarks.distal.y - landmarks.proximal.y
-        const ratio = currentDy / baseDy
+        // Map length to Euclidean distance to account for angled limbs
+        const baseDist = 64 // default distance (82 - 18)
+        const dx = landmarks.distal.x - landmarks.proximal.x
+        const dy = landmarks.distal.y - landmarks.proximal.y
+        const currentDist = Math.sqrt(dx * dx + dy * dy)
+        const ratio = currentDist / baseDist
         const newValue = parseFloat((m.value * ratio).toFixed(1))
-        const conf = Math.max(50, Math.min(99, m.confidence - 2)) // adjusting AI landmark drops confidence slightly
+        const conf = Math.max(50, Math.min(99, m.confidence - (hasLandmarkEdits ? 2 : 0)))
         return { ...m, value: newValue, confidence: conf }
       }
       if (m.key.toLowerCase().includes('proximal width') && landmarks.proximal) {
@@ -189,7 +201,7 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
         const dx = Math.abs(landmarks.proximal.x - 50)
         const ratio = (dx + 25) / 25
         const newValue = parseFloat((m.value * ratio).toFixed(1))
-        return { ...m, value: newValue, confidence: Math.max(50, m.confidence - 1) }
+        return { ...m, value: newValue, confidence: Math.max(50, m.confidence - (hasLandmarkEdits ? 1 : 0)) }
       }
       if (m.key.toLowerCase().includes('distal width') && landmarks.distal) {
         const dx = Math.abs(landmarks.distal.x - 50)
@@ -202,6 +214,18 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
         const dy = landmarks.mid.y / 50
         const newValue = parseFloat((m.value * dy).toFixed(1))
         return { ...m, value: newValue }
+      }
+      return m
+    })
+    
+    return aiAdjusted.map(m => {
+      const dbVal = c.measurements?.find(x => x.key === m.key)?.manualValue
+      const editVal = manualEdits[m.key]
+      const finalManualVal = editVal !== undefined ? editVal : dbVal
+      
+      // Only attach manualValue if it has been set, otherwise omit to keep it clean
+      if (finalManualVal !== undefined) {
+        return { ...m, manualValue: finalManualVal }
       }
       return m
     })
@@ -239,6 +263,37 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
     setHasLandmarkEdits(false)
     setBusy(false)
     triggerNotification('Landmark alignment updated and saved.')
+  }
+
+  const handleManualChange = (key: string, val: number | undefined) => {
+    setManualEdits(prev => ({ ...prev, [key]: val }))
+  }
+
+  async function saveManualMeasurements() {
+    if (isSavingManual) return
+    setIsSavingManual(true)
+    
+    const adjusted = getAdjustedMeasurements() // this includes the merged manualEdits!
+    
+    try {
+      const updatedCase = await updateCaseMeasurements(c.id, adjusted, c.images)
+      
+      writeAuditLog(
+        userEmail,
+        userRole,
+        'Save Manual Measurements',
+        `Doctor verified and saved manual measurement feedback for patient ${c.patientName} (${c.id}).`
+      )
+
+      onUpdated(updatedCase)
+      setManualEdits({}) // clear uncommitted edits
+      triggerNotification('Manual measurements saved for model feedback.')
+    } catch (err: any) {
+      console.error(err)
+      triggerNotification('Error saving manual measurements.')
+    } finally {
+      setIsSavingManual(false)
+    }
   }
 
   function regenerateSVG(part: string, angle: string, _score: number, lms: any, contourPath: string): string {
@@ -380,105 +435,111 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             
             {/* Viewfinder workspace */}
-            <div style={{ padding: 12, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-              <div 
-                ref={workspaceRef}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseUp}
-                style={{
-                  width: '100%', maxWidth: 280, aspectRatio: '1',
-                  background: 'var(--surface)', border: '1px solid var(--bdr)',
-                  borderRadius: 6, position: 'relative', overflow: 'hidden',
-                  cursor: draggingKey ? 'grabbing' : 'default',
-                  userSelect: 'none'
-                }}
-              >
-                {/* SVG base rendering */}
-                <img 
-                  src={activeImage.url} 
-                  alt={activeImage.angle} 
-                  style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
-                />
+            {activeImage ? (
+              <div style={{ padding: 12, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                <div 
+                  ref={workspaceRef}
+                  onMouseMove={handleMouseMove}
+                  onMouseUp={handleMouseUp}
+                  onMouseLeave={handleMouseUp}
+                  style={{
+                    width: '100%', maxWidth: 280, aspectRatio: '1',
+                    background: 'var(--surface)', border: '1px solid var(--bdr)',
+                    borderRadius: 6, position: 'relative', overflow: 'hidden',
+                    cursor: draggingKey ? 'grabbing' : 'default',
+                    userSelect: 'none'
+                  }}
+                >
+                  {/* SVG base rendering */}
+                  <img 
+                    src={activeImage.url} 
+                    alt={activeImage.angle} 
+                    style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
+                  />
 
-                {/* ArUco Calibration Tag overlay */}
-                {!isLidar && (
-                  <div style={{
-                    position: 'absolute', top: 6, left: 6,
-                    fontSize: 8, fontFamily: 'var(--mono)',
-                    background: 'rgba(16, 185, 129, 0.9)', color: 'white',
-                    padding: '2px 4px', borderRadius: 3, border: '1px solid rgba(255,255,255,0.2)'
-                  }}>
-                    ARUCO OK (1px=0.81mm)
+                  {/* ArUco Calibration Tag overlay */}
+                  {!isLidar && (
+                    <div style={{
+                      position: 'absolute', top: 6, left: 6,
+                      fontSize: 8, fontFamily: 'var(--mono)',
+                      background: 'rgba(16, 185, 129, 0.9)', color: 'white',
+                      padding: '2px 4px', borderRadius: 3, border: '1px solid rgba(255,255,255,0.2)'
+                    }}>
+                      ARUCO OK (1px=0.81mm)
+                    </div>
+                  )}
+
+                  {/* Draggable Pins */}
+                  {Object.entries(landmarks).map(([key, lm]) => (
+                    <div
+                      key={key}
+                      onMouseDown={handleMouseDown(key)}
+                      style={{
+                        position: 'absolute',
+                        left: `${lm.x}%`,
+                        top: `${lm.y}%`,
+                        transform: 'translate(-50%, -50%)',
+                        width: 14,
+                        height: 14,
+                        borderRadius: '50%',
+                        background: draggingKey === key ? 'var(--accent)' : 'var(--red)',
+                        border: '2px solid white',
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.25)',
+                        cursor: draggingKey === key ? 'grabbing' : 'grab',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 10
+                      }}
+                      title="Drag pin to calibrate landmark coordinate"
+                    >
+                      <div style={{ width: 4, height: 4, borderRadius: '50%', background: 'white' }} />
+                    </div>
+                  ))}
+                </div>
+
+                {/* Landmark Helper Note */}
+                <div style={{
+                  fontSize: 10, color: 'var(--ink-2)', width: '100%',
+                  marginTop: 8, textAlign: 'center', background: 'var(--surface)',
+                  padding: '6px 10px', borderRadius: 4, border: '1px solid var(--bdr)'
+                }}>
+                  ℹ Drag red keypoints to manually adjust alignment calibration.
+                </div>
+
+                {/* Adjustments Action */}
+                {hasLandmarkEdits && (
+                  <div style={{ display: 'flex', gap: 6, width: '100%', marginTop: 8 }}>
+                    <button
+                      onClick={() => {
+                        setLandmarks(JSON.parse(JSON.stringify(activeImage.landmarks || {})))
+                        setHasLandmarkEdits(false)
+                      }}
+                      style={{
+                        flex: 1, fontSize: 11, padding: '5px 8px', borderRadius: 4,
+                        background: 'var(--surface)', border: '1px solid var(--bdr-2)', cursor: 'pointer'
+                      }}
+                    >
+                      Revert
+                    </button>
+                    <button
+                      onClick={saveLandmarks}
+                      style={{
+                        flex: 2, fontSize: 11, padding: '5px 8px', borderRadius: 4,
+                        background: 'var(--accent)', color: 'white', border: 'none', cursor: 'pointer',
+                        fontWeight: 600
+                      }}
+                    >
+                      Save Landmark Edits
+                    </button>
                   </div>
                 )}
-
-                {/* Draggable Pins */}
-                {Object.entries(landmarks).map(([key, lm]) => (
-                  <div
-                    key={key}
-                    onMouseDown={handleMouseDown(key)}
-                    style={{
-                      position: 'absolute',
-                      left: `${lm.x}%`,
-                      top: `${lm.y}%`,
-                      transform: 'translate(-50%, -50%)',
-                      width: 14,
-                      height: 14,
-                      borderRadius: '50%',
-                      background: draggingKey === key ? 'var(--accent)' : 'var(--red)',
-                      border: '2px solid white',
-                      boxShadow: '0 2px 4px rgba(0,0,0,0.25)',
-                      cursor: draggingKey === key ? 'grabbing' : 'grab',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      zIndex: 10
-                    }}
-                    title="Drag pin to calibrate landmark coordinate"
-                  >
-                    <div style={{ width: 4, height: 4, borderRadius: '50%', background: 'white' }} />
-                  </div>
-                ))}
               </div>
-
-              {/* Landmark Helper Note */}
-              <div style={{
-                fontSize: 10, color: 'var(--ink-2)', width: '100%',
-                marginTop: 8, textAlign: 'center', background: 'var(--surface)',
-                padding: '6px 10px', borderRadius: 4, border: '1px solid var(--bdr)'
-              }}>
-                ℹ Drag red keypoints to manually adjust alignment calibration.
+            ) : (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--ink-3)', fontSize: 12 }}>
+                No scan images available for this case. Waiting for capture.
               </div>
-
-              {/* Adjustments Action */}
-              {hasLandmarkEdits && (
-                <div style={{ display: 'flex', gap: 6, width: '100%', marginTop: 8 }}>
-                  <button
-                    onClick={() => {
-                      setLandmarks(JSON.parse(JSON.stringify(activeImage.landmarks || {})))
-                      setHasLandmarkEdits(false)
-                    }}
-                    style={{
-                      flex: 1, fontSize: 11, padding: '5px 8px', borderRadius: 4,
-                      background: 'var(--surface)', border: '1px solid var(--bdr-2)', cursor: 'pointer'
-                    }}
-                  >
-                    Revert
-                  </button>
-                  <button
-                    onClick={saveLandmarks}
-                    style={{
-                      flex: 2, fontSize: 11, padding: '5px 8px', borderRadius: 4,
-                      background: 'var(--accent)', color: 'white', border: 'none', cursor: 'pointer',
-                      fontWeight: 600
-                    }}
-                  >
-                    Save Landmark Edits
-                  </button>
-                </div>
-              )}
-            </div>
+            )}
 
             {/* Thumbnail selector */}
             <ImageGrid images={c.images} selectedIndex={selImg} onSelect={setSelImg} />
@@ -490,6 +551,9 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
               measurements={measurementsToDisplay} 
               bodyPart={c.bodyPart} 
               side={c.side} 
+              onManualChange={handleManualChange}
+              onSaveManual={Object.keys(manualEdits).length > 0 ? saveManualMeasurements : undefined}
+              isSavingManual={isSavingManual}
             />
           </div>
         )}
