@@ -18,7 +18,7 @@ dependencies:
   path: ^1.9.0
   permission_handler: ^11.3.1
   google_mlkit_pose_detection: ^0.15.0
-
+  opencv_dart: ^2.2.1+4
 dev_dependencies:
   flutter_test:
     sdk: flutter

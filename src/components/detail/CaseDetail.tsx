@@ -6,6 +6,7 @@ import ImageGrid from './ImageGrid'
 import MeasurementReadout from './MeasurementReadout'
 import Cast3DVisualizer from './Cast3DVisualizer'
 import { relativeTime } from '../../utils'
+import { generateCastSTL, deriveGeometryFromMeasurements, downloadSTL } from '../../utils/stlExporter'
 
 // ── Default measurements per body part (used when scan has no stored measurements) ──
 function getDefaultMeasurements(bodyPart: string): Measurement[] {
@@ -337,7 +338,7 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
     triggerNotification('3D Cast fabrication specifications saved.')
   }
 
-  // Mock downloading STL / G-Code
+  // Generate and download real binary STL from patient measurements
   function exportCastFile(type: 'stl' | 'gcode') {
     writeAuditLog(
       userEmail,
@@ -345,7 +346,21 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
       type === 'stl' ? 'Export STL Mesh' : 'Export G-Code',
       `Exported custom ${castType} design in ${type.toUpperCase()} format for patient ${c.patientName} (${c.id}). Spec Weight: ~240g.`
     )
-    triggerNotification(`Exporting custom 3D cast ${type.toUpperCase()} mesh...`)
+
+    if (type === 'stl') {
+      // Derive geometry from real measurements (same formula as Cast3DVisualizer)
+      const geo = deriveGeometryFromMeasurements(
+        measurementsToDisplay,
+        c.bodyPart,
+        thickness
+      )
+      const stlBuffer = generateCastSTL(geo, c.patientName, c.bodyPart)
+      const safeName = `cast_${c.patientName.replace(/\s+/g, '_')}_${c.bodyPart}_${c.side}`
+      downloadSTL(stlBuffer, safeName)
+      triggerNotification(`STL file downloaded: ${safeName}.stl (${((stlBuffer.byteLength)/1024).toFixed(1)} KB)`)
+    } else {
+      triggerNotification(`G-Code export: route through your slicer from the downloaded STL.`)
+    }
   }
 
   // Send to 3D printer
@@ -572,6 +587,8 @@ export default function CaseDetail({ orthoCase, onUpdated, userEmail, userRole }
                 ventPattern={ventPattern}
                 thickness={thickness}
                 isLidar={!!isLidar}
+                measurements={measurementsToDisplay}
+                bodyPart={c.bodyPart}
               />
               {/* Drag hint */}
               <div style={{

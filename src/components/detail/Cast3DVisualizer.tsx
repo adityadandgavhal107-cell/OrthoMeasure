@@ -5,6 +5,8 @@ interface Props {
   ventPattern: string
   thickness: number
   isLidar?: boolean
+  measurements?: { key: string; value: number; manualValue?: number }[]
+  bodyPart?: string
 }
 
 interface Point3D {
@@ -13,7 +15,7 @@ interface Point3D {
   z: number
 }
 
-export default function Cast3DVisualizer({ castColor, ventPattern, thickness, isLidar }: Props) {
+export default function Cast3DVisualizer({ castColor, ventPattern, thickness, isLidar, measurements = [], bodyPart = 'Forearm' }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   
   // Rotation angles in radians
@@ -61,6 +63,38 @@ export default function Cast3DVisualizer({ castColor, ventPattern, thickness, is
     isDragging.current = false
   }
 
+  // ─── Derive geometry from real patient measurements ──────────────────────
+  // Measurements are stored in cm; convert to canvas units (pixels) using a
+  // consistent scale: 1 cm = 2.8 px at 160 ring-height baseline.
+  const getM = (keyword: string, fallback: number) => {
+    const m = measurements.find(x => x.key.toLowerCase().includes(keyword))
+    if (!m) return fallback
+    return (m.manualValue !== undefined && m.manualValue > 0) ? m.manualValue : m.value
+  }
+
+  const part = (bodyPart || 'Forearm').toLowerCase()
+
+  // Anatomical fallbacks (cm) → canvas px (1 cm ≈ 2.0 px for ring radius)
+  // These match the STL exporter fallbacks
+  let fallbackProxCircCm = 23, fallbackDistCircCm = 16.5, fallbackLenCm = 25
+  if (part.includes('wrist'))    { fallbackProxCircCm = 16.5; fallbackDistCircCm = 16;   fallbackLenCm = 12  }
+  if (part.includes('ankle'))    { fallbackProxCircCm = 26;   fallbackDistCircCm = 22;   fallbackLenCm = 20  }
+  if (part.includes('elbow'))    { fallbackProxCircCm = 29;   fallbackDistCircCm = 23;   fallbackLenCm = 14  }
+  if (part.includes('hand'))     { fallbackProxCircCm = 16.5; fallbackDistCircCm = 19.5; fallbackLenCm = 18  }
+  if (part.includes('foot'))     { fallbackProxCircCm = 22;   fallbackDistCircCm = 24;   fallbackLenCm = 22  }
+  if (part.includes('knee'))     { fallbackProxCircCm = 38;   fallbackDistCircCm = 31;   fallbackLenCm = 25  }
+  if (part.includes('shoulder')) { fallbackProxCircCm = 35;   fallbackDistCircCm = 29;   fallbackLenCm = 20  }
+
+  const proxCircCm = getM('proximal', fallbackProxCircCm)
+  const distCircCm = getM('wrist circumference', fallbackDistCircCm)
+  const lenCm      = getM('total length', fallbackLenCm)
+
+  // Convert circumference → radius in canvas units (scale: 1 cm = 1.6 canvas px)
+  const SCALE = 1.6
+  const radiusProximal = Math.max(10, (proxCircCm / (2 * Math.PI)) * SCALE)
+  const radiusDistal   = Math.max(8,  (distCircCm / (2 * Math.PI)) * SCALE)
+  const ringHeight     = Math.max(60, lenCm * SCALE * 4.5)
+
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -107,36 +141,92 @@ export default function Cast3DVisualizer({ castColor, ventPattern, thickness, is
       // ─── 1. Draw inner forearm limb bone / core ────────────────────────────
       const rings = 12
       const segments = 16
-      const ringHeight = 160
-      const radiusElbow = 36
-      const radiusWrist = 20
 
-      // Generate points
+      // Point generation lists
       const outerVerts: Point3D[][] = []
       const innerVerts: Point3D[][] = []
       const armVerts: Point3D[][] = []
 
       const shellThick = thickness * 2.2
 
+      // Math matches stlExporter.ts exactly, scaled for the canvas
+      const getSliceParams = (t: number) => {
+        let cx = 0
+        let cy = -ringHeight / 2 + t * ringHeight
+        let cz = 0
+        let rxScale = 1.0
+        let rzScale = 1.0
+
+        let baseRad = radiusDistal * (1 - t) + radiusProximal * t
+
+        if (part.includes('ankle') || part.includes('foot')) {
+          const bendT = 0.4
+          if (t < bendT) {
+            const factor = (bendT - t) / bendT
+            cz = factor * ringHeight * 0.45
+            cy = -ringHeight / 2 + (bendT * ringHeight) * 0.15 * (1 - factor)
+            rxScale = 1.0 - factor * 0.12
+            rzScale = 1.0 + factor * 0.25
+            baseRad = radiusDistal * 1.15
+          } else {
+            const factor = (t - bendT) / (1 - bendT)
+            baseRad = radiusDistal * (1 - factor) + radiusProximal * factor
+          }
+        } else if (part.includes('elbow') || part.includes('knee')) {
+          const bendT = 0.5
+          const angle = 0.7
+          if (t > bendT) {
+            const factor = (t - bendT) / (1 - bendT)
+            const bendDist = factor * (ringHeight * 0.5)
+            cz = -bendDist * Math.sin(angle)
+            cy = -ringHeight / 2 + bendT * ringHeight + bendDist * Math.cos(angle)
+          }
+          const jointBulge = Math.exp(-Math.pow(t - bendT, 2) * 50) * 0.15
+          baseRad = baseRad * (1 + jointBulge)
+        } else if (part.includes('wrist') || part.includes('hand')) {
+          const wristT = 0.3
+          if (t < wristT) {
+            const factor = (wristT - t) / wristT
+            baseRad = radiusDistal * (1.0 + factor * 0.22)
+            rxScale = 1.1 + factor * 0.2
+            rzScale = 0.95 - factor * 0.1
+          } else {
+            const factor = (t - wristT) / (1 - wristT)
+            baseRad = radiusDistal * (1.0 - factor * 0.05) + radiusProximal * factor
+            rxScale = 1.0 + (1 - factor) * 0.1
+            rzScale = 1.0 - (1 - factor) * 0.1
+          }
+        } else {
+          const bulge = Math.sin(t * Math.PI) * 0.15
+          baseRad = baseRad * (1.0 + bulge)
+          rxScale = 1.05
+          rzScale = 0.95
+        }
+
+        return { cx, cy, cz, rx: baseRad * rxScale, rz: baseRad * rzScale }
+      }
+
       for (let r = 0; r <= rings; r++) {
         const t = r / rings // 0 to 1
-        const y = -ringHeight / 2 + t * ringHeight
-        const rOuter = radiusElbow * (1 - t) + radiusWrist * t
-        const rInner = rOuter - shellThick
-        const rArm = rOuter - shellThick - 4
-
+        const { cx, cy, cz, rx: sliceRx, rz: sliceRz } = getSliceParams(t)
+        
         const outerRing: Point3D[] = []
         const innerRing: Point3D[] = []
         const armRing: Point3D[] = []
+
+        const inRx = Math.max(4, sliceRx - shellThick)
+        const inRz = Math.max(4, sliceRz - shellThick)
+        const armRx = Math.max(2, sliceRx - shellThick - 4)
+        const armRz = Math.max(2, sliceRz - shellThick - 4)
 
         for (let s = 0; s < segments; s++) {
           const theta = (s / segments) * Math.PI * 2
           const cos = Math.cos(theta)
           const sin = Math.sin(theta)
 
-          outerRing.push({ x: rOuter * cos, y, z: rOuter * sin })
-          innerRing.push({ x: rInner * cos, y, z: rInner * sin })
-          armRing.push({ x: rArm * cos, y, z: rArm * sin })
+          outerRing.push({ x: cx + sliceRx * cos, y: cy, z: cz + sliceRz * sin })
+          innerRing.push({ x: cx + inRx * cos,    y: cy, z: cz + inRz * sin })
+          armRing.push({   x: cx + armRx * cos,   y: cy, z: cz + armRz * sin })
         }
 
         outerVerts.push(outerRing)
@@ -303,7 +393,7 @@ export default function Cast3DVisualizer({ castColor, ventPattern, thickness, is
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current)
     }
-  }, [rx, ry, hexColor, ventPattern, thickness, isLidar])
+  }, [rx, ry, hexColor, ventPattern, thickness, isLidar, radiusProximal, radiusDistal, ringHeight])
 
   return (
     <canvas

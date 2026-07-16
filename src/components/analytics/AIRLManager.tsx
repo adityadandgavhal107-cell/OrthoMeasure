@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../data/supabase'
 
 interface Weights {
@@ -18,6 +18,20 @@ interface LogEntry {
   avg_error_pct: number;
 }
 
+interface TrainingNote {
+  session_id: string;
+  source: string;
+  images_processed: number;
+  epochs_run: number;
+  avg_reward_before: number | string;
+  avg_error_before: number | string;
+  avg_reward_after: number;
+  avg_error_after: number;
+  reward_delta: number;
+  error_delta: number;
+  notes: string;
+}
+
 interface ModelData {
   weights: Weights;
   trained_cases: string[];
@@ -29,175 +43,215 @@ interface ModelData {
   };
 }
 
+// Live approved case record from Supabase
+interface ApprovedCase {
+  id: string
+  patient_name: string
+  body_part: string
+  status: string
+  submitted_at: string
+  measurements: unknown[]
+  images: unknown[]
+}
+
 export default function AIRLManager() {
   const [modelData, setModelData] = useState<ModelData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [refreshKey, setRefreshKey] = useState(0)
-  
+
+  // Live DB state
+  const [approvedCases, setApprovedCases] = useState<ApprovedCase[]>([])
+  const [dbLoading, setDbLoading] = useState(true)
+  const [showUntrainedOnly, setShowUntrainedOnly] = useState(false)
+
+  // Dataset training notes
+  const [trainingNotes, setTrainingNotes] = useState<TrainingNote[]>([])
+  const [notesLoading, setNotesLoading] = useState(true)
+
+  // ZIP upload state
+  const [zipDragOver, setZipDragOver] = useState(false)
+  const [zipStatus, setZipStatus] = useState<'idle' | 'processing' | 'done' | 'error'>('idle')
+  const [zipMessage, setZipMessage] = useState('')
+
   // Sandbox states
   const [age, setAge] = useState(25)
   const [gender, setGender] = useState<'M' | 'F' | 'Other'>('M')
   const [side, setSide] = useState<'Left' | 'Right'>('Right')
-  const [bodyPart, setBodyPart] = useState<'Forearm' | 'Wrist' | 'Ankle' | 'Elbow'>('Forearm')
+  const [bodyPart, setBodyPart] = useState<string>('Forearm')
   const [mobility, setMobility] = useState<'Normal' | 'Limited' | 'None'>('Limited')
   const [swelling, setSwelling] = useState<'Normal' | 'Mild' | 'Moderate' | 'Severe'>('Moderate')
   const [angle, setAngle] = useState<'Front' | 'Back' | 'Left' | 'Right' | '45° Left' | '45° Right'>('Front')
 
-  // Load from Supabase scans public URL
-  useEffect(() => {
-    async function loadWeights() {
-      try {
-        setLoading(true)
-        setError('')
-        const publicUrl = supabase.storage.from('scans').getPublicUrl('rl_model_data.json').data.publicUrl
-        
-        // Cache bust
-        const res = await fetch(`${publicUrl}?t=${Date.now()}`)
-        if (!res.ok) {
-          throw new Error('Model file not found in storage. Ensure you run "python rl_agent.py --train-all" to initialize it.')
-        }
-        
-        const data = await res.json() as ModelData
-        setModelData(data)
-      } catch (err: any) {
-        console.error(err)
-        setError(err.message || 'Failed to download model weights.')
-      } finally {
-        setLoading(false)
-      }
+  // Load model weights from Supabase Storage
+  const loadWeights = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError('')
+      const publicUrl = supabase.storage.from('scans').getPublicUrl('rl_model_data.json').data.publicUrl
+      const res = await fetch(`${publicUrl}?t=${Date.now()}`)
+      if (!res.ok) throw new Error('Model file not found in storage. Run "python rl_agent.py --train-all" to initialize it.')
+      const data = await res.json() as ModelData
+      setModelData(data)
+    } catch (err: any) {
+      console.error(err)
+      setError(err.message || 'Failed to download model weights.')
+    } finally {
+      setLoading(false)
     }
-    
-    loadWeights()
-  }, [refreshKey])
+  }, [])
 
-  // TypeScript Feedforward inference logic
+  // Load live approved cases from Supabase DB
+  const loadApprovedCases = useCallback(async () => {
+    setDbLoading(true)
+    try {
+      const { data, error } = await supabase
+        .from('ortho_cases')
+        .select('id, patient_name, body_part, status, submitted_at, measurements, images')
+        .eq('status', 'approved')
+        .order('submitted_at', { ascending: false })
+      if (!error && data) setApprovedCases(data as ApprovedCase[])
+    } catch (e) {
+      console.error('Failed to load approved cases:', e)
+    } finally {
+      setDbLoading(false)
+    }
+  }, [])
+
+  // Load training notes from Supabase storage
+  const loadTrainingNotes = useCallback(async () => {
+    setNotesLoading(true)
+    try {
+      const publicUrl = supabase.storage.from('scans').getPublicUrl('rl_training_notes.json').data.publicUrl
+      const res = await fetch(`${publicUrl}?t=${Date.now()}`)
+      if (res.ok) {
+        const data = await res.json() as TrainingNote[]
+        setTrainingNotes(Array.isArray(data) ? data.slice().reverse() : [])
+      } else {
+        setTrainingNotes([])
+      }
+    } catch {
+      setTrainingNotes([])
+    } finally {
+      setNotesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { loadWeights() }, [refreshKey, loadWeights])
+  useEffect(() => { loadApprovedCases() }, [refreshKey, loadApprovedCases])
+  useEffect(() => { loadTrainingNotes() }, [refreshKey, loadTrainingNotes])
+
+  // Handle ZIP file selection (drag-and-drop or picker)
+  const handleZipFile = (file: File) => {
+    if (!file.name.endsWith('.zip')) {
+      setZipStatus('error')
+      setZipMessage('Please select a valid .zip file.')
+      return
+    }
+    setZipStatus('processing')
+    setZipMessage(`📦 Received "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB). To train the model, run:\n\npython train_from_dataset.py --dataset forearm.coco-segmentation\n\nfrom the project root directory. The training notes will appear below once complete.`)
+    setZipStatus('done')
+  }
+
+  // ── Body-part landmark defaults (matches body_part_config.dart) ─────────────
+  const BODY_PART_DEFAULTS: Record<string, { labels: string[]; defaults: number[] }> = {
+    Forearm:  { labels: ['Elbow Crease', 'Mid Forearm', 'Wrist Joint'],         defaults: [50,18, 50,50, 50,82] },
+    Wrist:    { labels: ['Distal Forearm', 'Wrist Crease', 'MCP Joint'],        defaults: [50,25, 50,50, 50,75] },
+    Elbow:    { labels: ['Upper Arm', 'Olecranon', 'Prox. Forearm'],            defaults: [50,25, 50,52, 50,75] },
+    Hand:     { labels: ['Wrist', 'Mid Palm', 'Finger Tips'],                   defaults: [50,20, 50,50, 50,80] },
+    Ankle:    { labels: ['Knee', 'Mid Leg', 'Ankle'],                           defaults: [50,22, 50,62, 50,82] },
+    Foot:     { labels: ['Ankle', 'Mid Foot', 'Toes'],                          defaults: [50,18, 50,50, 50,82] },
+    Knee:     { labels: ['Mid Thigh', 'Patella', 'Tibial Crest'],               defaults: [50,18, 50,50, 50,82] },
+    Shoulder: { labels: ['Acromion', 'GH Joint', 'Upper Arm'],                  defaults: [50,20, 50,50, 50,80] },
+  }
+
+  // ── Feedforward inference (supports 23-dim old weights + 26-dim new) ─────────
   function runInference(): { name: string; defX: number; defY: number; predX: number; predY: number }[] {
-    if (!modelData || !modelData.weights) return []
-    
+    if (!modelData?.weights) return []
     const w = modelData.weights
-    
-    // Build state vector (23 dimensions)
-    const state = new Array(23).fill(0)
-    
-    // 0: Age (normalized)
+    const inputDim = w.W1.length // auto-detect: 23 (old) or 27 (new)
+
+    // Build state vector
+    const state = new Array(inputDim).fill(0)
     state[0] = age / 100.0
-    
-    // 1-3: Gender
     if (gender === 'M') state[1] = 1.0
     else if (gender === 'F') state[2] = 1.0
     else state[3] = 1.0
-    
-    // 4-5: Side
     if (side === 'Left') state[4] = 1.0
     else state[5] = 1.0
-    
-    // 6-9: Body Part
-    if (bodyPart === 'Forearm') state[6] = 1.0
-    else if (bodyPart === 'Wrist') state[7] = 1.0
-    else if (bodyPart === 'Ankle') state[8] = 1.0
-    else state[9] = 1.0
-    
-    // 10-12: Mobility
-    if (mobility === 'Normal') state[10] = 1.0
-    else if (mobility === 'Limited') state[11] = 1.0
-    else state[12] = 1.0
-    
-    // 13-16: Swelling
-    if (swelling === 'Normal') state[13] = 1.0
-    else if (swelling === 'Mild') state[14] = 1.0
-    else if (swelling === 'Moderate') state[15] = 1.0
-    else state[16] = 1.0
-    
-    // 17-22: Angle
-    const angles = ['Front', 'Back', 'Left', 'Right', '45° Left', '45° Right']
-    const angleIdx = angles.indexOf(angle)
-    if (angleIdx !== -1) {
-      state[17 + angleIdx] = 1.0
-    }
-    
-    // Matrix calculations
-    // Hidden 1: ReLU(X * W1 + b1)
-    const h1: number[] = []
-    const w1Cols = w.W1[0].length
-    for (let j = 0; j < w1Cols; j++) {
-      let sum = w.b1[0][j]
-      for (let i = 0; i < 23; i++) {
-        sum += state[i] * w.W1[i][j]
-      }
-      h1.push(Math.max(0, sum))
-    }
-    
-    // Hidden 2: ReLU(h1 * W2 + b2)
-    const h2: number[] = []
-    const w2Cols = w.W2[0].length
-    for (let j = 0; j < w2Cols; j++) {
-      let sum = w.b2[0][j]
-      for (let i = 0; i < h1.length; i++) {
-        sum += h1[i] * w.W2[i][j]
-      }
-      h2.push(Math.max(0, sum))
-    }
-    
-    // Output layer: h2 * W3 + b3
-    const offsets: number[] = []
-    const w3Cols = w.W3[0].length
-    for (let j = 0; j < w3Cols; j++) {
-      let sum = w.b3[0][j]
-      for (let i = 0; i < h2.length; i++) {
-        sum += h2[i] * w.W3[i][j]
-      }
-      offsets.push(sum)
-    }
-    
-    // Default landmarks based on body part
-    let defaults = [50.0, 18.0, 50.0, 50.0, 50.0, 82.0]
-    let labels = ['Proximal', 'Mid-point', 'Distal']
-    
-    if (bodyPart === 'Forearm') {
-      defaults = [50.0, 18.0, 50.0, 50.0, 50.0, 82.0]
-      labels = ['Elbow Crease', 'Mid Forearm', 'Wrist Joint']
-    } else if (bodyPart === 'Wrist') {
-      defaults = [50.0, 25.0, 50.0, 50.0, 50.0, 75.0]
-      labels = ['Distal Forearm', 'Wrist Crease', 'MCP Joint']
-    } else if (bodyPart === 'Ankle') {
-      defaults = [50.0, 22.0, 50.0, 62.0, 50.0, 82.0]
-      labels = ['Calf Base', 'Lateral Malleolus', 'Heel Base']
-    } else {
-      defaults = [50.0, 25.0, 50.0, 52.0, 50.0, 75.0]
-      labels = ['Upper Arm', 'Olecranon', 'Prox. Forearm']
-    }
-    
+
+    // Body part encoding — 8 parts if inputDim >= 27, else 4
+    const ALL_PARTS = ['Forearm','Wrist','Ankle','Elbow','Hand','Foot','Knee','Shoulder']
+    const LEGACY_PARTS = ['Forearm','Wrist','Ankle','Elbow']
+    const parts = inputDim >= 27 ? ALL_PARTS : LEGACY_PARTS
+    const bpIdx = parts.indexOf(bodyPart)
+    if (bpIdx !== -1 && 6 + bpIdx < inputDim) state[6 + bpIdx] = 1.0
+    else if (bpIdx === -1 && inputDim < 27) state[9] = 1.0 // Elbow bucket for unknown
+
+    // Offset base for mobility depends on how many body-part slots there are
+    const mobilityBase = inputDim >= 27 ? 14 : 10
+    if (mobility === 'Normal') state[mobilityBase] = 1.0
+    else if (mobility === 'Limited') state[mobilityBase + 1] = 1.0
+    else state[mobilityBase + 2] = 1.0
+
+    const swellingBase = mobilityBase + 3
+    if (swelling === 'Normal') state[swellingBase] = 1.0
+    else if (swelling === 'Mild') state[swellingBase + 1] = 1.0
+    else if (swelling === 'Moderate') state[swellingBase + 2] = 1.0
+    else state[swellingBase + 3] = 1.0
+
+    const angleBase = swellingBase + 4
+    const angles = ['Front','Back','Left','Right','45° Left','45° Right']
+    const aIdx = angles.indexOf(angle)
+    if (aIdx !== -1 && angleBase + aIdx < inputDim) state[angleBase + aIdx] = 1.0
+
+    // Forward pass
+    const relu = (x: number) => Math.max(0, x)
+    const h1 = w.W1[0].map((_: number, j: number) => {
+      let s = w.b1[0][j]
+      for (let i = 0; i < inputDim && i < w.W1.length; i++) s += state[i] * w.W1[i][j]
+      return relu(s)
+    })
+    const h2 = w.W2[0].map((_: number, j: number) => {
+      let s = w.b2[0][j]
+      for (let i = 0; i < h1.length; i++) s += h1[i] * w.W2[i][j]
+      return relu(s)
+    })
+    const offsets = w.W3[0].map((_: number, j: number) => {
+      let s = w.b3[0][j]
+      for (let i = 0; i < h2.length; i++) s += h2[i] * w.W3[i][j]
+      return s
+    })
+
+    const cfg = BODY_PART_DEFAULTS[bodyPart] ?? BODY_PART_DEFAULTS['Forearm']
+    const { labels, defaults: def } = cfg
+
     return [
-      {
-        name: labels[0],
-        defX: defaults[0], defY: defaults[1],
-        predX: Math.max(5, Math.min(95, defaults[0] + offsets[0])),
-        predY: Math.max(5, Math.min(95, defaults[1] + offsets[1]))
-      },
-      {
-        name: labels[1],
-        defX: defaults[2], defY: defaults[3],
-        predX: Math.max(5, Math.min(95, defaults[2] + offsets[2])),
-        predY: Math.max(5, Math.min(95, defaults[3] + offsets[3]))
-      },
-      {
-        name: labels[2],
-        defX: defaults[4], defY: defaults[5],
-        predX: Math.max(5, Math.min(95, defaults[4] + offsets[4])),
-        predY: Math.max(5, Math.min(95, defaults[5] + offsets[5]))
-      }
+      { name: labels[0], defX: def[0], defY: def[1],
+        predX: Math.max(5, Math.min(95, def[0] + (offsets[0] ?? 0))),
+        predY: Math.max(5, Math.min(95, def[1] + (offsets[1] ?? 0))) },
+      { name: labels[1], defX: def[2], defY: def[3],
+        predX: Math.max(5, Math.min(95, def[2] + (offsets[2] ?? 0))),
+        predY: Math.max(5, Math.min(95, def[3] + (offsets[3] ?? 0))) },
+      { name: labels[2], defX: def[4], defY: def[5],
+        predX: Math.max(5, Math.min(95, def[4] + (offsets[4] ?? 0))),
+        predY: Math.max(5, Math.min(95, def[5] + (offsets[5] ?? 0))) },
     ]
   }
 
   const predictions = runInference()
+
+  // Derived: which approved cases have NOT been trained on yet
+  const trainedIds = new Set(modelData?.trained_cases ?? [])
+  const untrainedCases = approvedCases.filter(c => !trainedIds.has(c.id))
+  const casesToShow = showUntrainedOnly ? untrainedCases : approvedCases
 
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', flex: 1, height: '100%',
       padding: '24px', overflowY: 'auto', background: 'var(--bg)', color: 'var(--ink)'
     }}>
-      
+
       {/* Title */}
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--accent)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
@@ -207,7 +261,7 @@ export default function AIRLManager() {
           🧠 AI Reinforcement Learning Center
         </h1>
         <p style={{ fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.5, margin: 0, maxWidth: 800 }}>
-          Manage the closed-loop, human-in-the-loop landmark reinforcement agent. When clinical team members adjust forearm, wrist, or ankle landmarks, the deviations act as training signals. The model refines itself online to minimize error rates.
+          Closed-loop, human-in-the-loop landmark reinforcement agent. Doctor landmark adjustments and manual measurements act as training signals. The policy network refines itself to minimize anatomical displacement error across all approved patient cases.
         </p>
       </div>
 
@@ -222,9 +276,9 @@ export default function AIRLManager() {
         }}>
           <div>⚠️ {error}</div>
           <div style={{ fontSize: 11, color: 'var(--ink-2)' }}>
-            To resolve this: run <code>python rl_agent.py --train-all</code> inside the workspace folder in your terminal to initialize weights and upload them to Supabase scans storage.
+            To resolve this: run <code>python rl_agent.py --train-all</code> inside the workspace folder to initialize weights and upload them to Supabase scans storage.
           </div>
-          <button 
+          <button
             onClick={() => setRefreshKey(k => k + 1)}
             style={{
               padding: '6px 12px', background: 'var(--red)', color: 'white',
@@ -241,23 +295,123 @@ export default function AIRLManager() {
           {/* Main Panel */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
             
-            {/* Stats row */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 16, borderRadius: 8 }}>
-                <div style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Trained Patient Cases</div>
-                <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>{modelData?.stats?.total_trained || 0}</div>
-                <div style={{ fontSize: 11, color: 'var(--green)', marginTop: 4 }}>● Online & Monitoring</div>
+            {/* Stats row — 4 cards now */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+              {/* Card 1: Live DB count */}
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 14, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Approved in DB</div>
+                <div style={{ fontSize: 26, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>
+                  {dbLoading ? '…' : approvedCases.length}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--green)', marginTop: 4 }}>● Live from Supabase</div>
               </div>
-              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 16, borderRadius: 8 }}>
-                <div style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Policy Reward Rating</div>
-                <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>{modelData?.stats?.current_avg_reward || 0}%</div>
-                <div style={{ fontSize: 11, color: 'var(--ink-2)', marginTop: 4 }}>Max possible: 100%</div>
+              {/* Card 2: Model-trained */}
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 14, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Model Trained</div>
+                <div style={{ fontSize: 26, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>
+                  {modelData?.stats?.total_trained ?? 0}
+                </div>
+                <div style={{ fontSize: 10, color: untrainedCases.length > 0 ? 'var(--amber)' : 'var(--green)', marginTop: 4 }}>
+                  {untrainedCases.length > 0 ? `⚠ ${untrainedCases.length} untrained` : '✓ All trained'}
+                </div>
               </div>
-              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 16, borderRadius: 8 }}>
-                <div style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Avg Displacement Error</div>
-                <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>{modelData?.stats?.current_avg_error || 0}%</div>
-                <div style={{ fontSize: 11, color: 'var(--ink-2)', marginTop: 4 }}>Standard scale deviation</div>
+              {/* Card 3: Reward */}
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 14, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Policy Reward</div>
+                <div style={{ fontSize: 26, fontWeight: 700, marginTop: 4, color: 'var(--ink)' }}>{modelData?.stats?.current_avg_reward ?? 0}%</div>
+                <div style={{ fontSize: 10, color: 'var(--ink-2)', marginTop: 4 }}>Max possible: 100%</div>
               </div>
+              {/* Card 4: Error */}
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', padding: 14, borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: 'var(--ink-3)', fontWeight: 600, textTransform: 'uppercase' }}>Avg Error</div>
+                <div style={{
+                  fontSize: 26, fontWeight: 700, marginTop: 4,
+                  color: (modelData?.stats?.current_avg_error ?? 99) < 5 ? 'var(--green)' : 'var(--amber)'
+                }}>{modelData?.stats?.current_avg_error ?? 0}%</div>
+                <div style={{ fontSize: 10, color: 'var(--ink-2)', marginTop: 4 }}>Scale deviation</div>
+              </div>
+            </div>
+
+            {/* Live Approved Patient Cases Table */}
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 8, padding: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <h2 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Approved Patient Cases — Live Feed</h2>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <label style={{ fontSize: 10, color: 'var(--ink-2)', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={showUntrainedOnly}
+                      onChange={e => setShowUntrainedOnly(e.target.checked)}
+                      style={{ cursor: 'pointer' }}
+                    />
+                    Untrained only
+                  </label>
+                  <button
+                    onClick={() => setRefreshKey(k => k + 1)}
+                    style={{
+                      fontSize: 10, background: 'transparent', border: '1px solid var(--bdr)',
+                      padding: '3px 7px', borderRadius: 4, color: 'var(--ink-2)', cursor: 'pointer'
+                    }}
+                  >
+                    ↻ Refresh
+                  </button>
+                </div>
+              </div>
+
+              {dbLoading ? (
+                <div style={{ padding: '20px 0', textAlign: 'center', fontSize: 12, color: 'var(--ink-3)' }}>Loading patient records…</div>
+              ) : casesToShow.length === 0 ? (
+                <div style={{ padding: '20px 0', textAlign: 'center', fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic' }}>
+                  {showUntrainedOnly ? 'All approved cases have been trained ✓' : 'No approved cases yet.'}
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 0, maxHeight: 220, overflowY: 'auto' }}>
+                  {/* Header */}
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: '1fr 100px 90px 80px',
+                    fontSize: 9, fontWeight: 700, color: 'var(--ink-3)', textTransform: 'uppercase',
+                    padding: '4px 8px', borderBottom: '1px solid var(--bdr)', letterSpacing: '0.05em'
+                  }}>
+                    <span>Patient</span><span>Body Part</span><span>Model Status</span><span>Images</span>
+                  </div>
+                  {casesToShow.map(c => {
+                    const trained = trainedIds.has(c.id)
+                    const imgCount = Array.isArray(c.images) ? c.images.length : 0
+                    return (
+                      <div key={c.id} style={{
+                        display: 'grid', gridTemplateColumns: '1fr 100px 90px 80px',
+                        fontSize: 11, padding: '7px 8px',
+                        borderBottom: '1px solid var(--bdr)',
+                        background: trained ? 'transparent' : 'rgba(245,158,11,0.04)',
+                        alignItems: 'center'
+                      }}>
+                        <div>
+                          <div style={{ fontWeight: 500, color: 'var(--ink)' }}>{c.patient_name}</div>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', fontFamily: 'var(--mono)', marginTop: 1 }}>{c.id.slice(0, 12)}…</div>
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--ink-2)' }}>{c.body_part}</div>
+                        <div style={{
+                          fontSize: 9, fontWeight: 600,
+                          color: trained ? 'var(--green)' : 'var(--amber)'
+                        }}>
+                          {trained ? '✓ Trained' : '⚠ Needs train'}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--ink-3)' }}>{imgCount} angle{imgCount !== 1 ? 's' : ''}</div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {untrainedCases.length > 0 && (
+                <div style={{
+                  marginTop: 10, padding: '8px 10px', background: 'rgba(245,158,11,0.08)',
+                  border: '1px solid rgba(245,158,11,0.25)', borderRadius: 6, fontSize: 11, color: 'var(--amber)'
+                }}>
+                  ⚠ <strong>{untrainedCases.length}</strong> approved case{untrainedCases.length > 1 ? 's' : ''} not yet in model weights.
+                  Run <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.1)', padding: '1px 4px', borderRadius: 3 }}>python rl_agent.py --train-all</code> to retrain.
+                </div>
+              )}
             </div>
 
             {/* Neural Net visualizer card */}
@@ -367,6 +521,154 @@ export default function AIRLManager() {
               </div>
             </div>
 
+            {/* ── Dataset Training Notes ── */}
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 8, padding: 18 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                <h2 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>📋 Dataset Training Session Notes</h2>
+                <button
+                  onClick={() => setRefreshKey(k => k + 1)}
+                  style={{ fontSize: 10, background: 'transparent', border: '1px solid var(--bdr)', padding: '4px 8px', borderRadius: 4, color: 'var(--ink-2)', cursor: 'pointer' }}
+                >
+                  ↻ Refresh Notes
+                </button>
+              </div>
+              <p style={{ fontSize: 11, color: 'var(--ink-2)', margin: '0 0 12px 0', lineHeight: 1.5 }}>
+                Each time you run <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.07)', padding: '1px 5px', borderRadius: 3 }}>python train_from_dataset.py</code> a session summary is recorded here showing model improvement.
+              </p>
+
+              {notesLoading ? (
+                <div style={{ padding: '16px 0', textAlign: 'center', fontSize: 12, color: 'var(--ink-3)' }}>Loading session notes…</div>
+              ) : trainingNotes.length === 0 ? (
+                <div style={{
+                  padding: '20px', background: 'rgba(0,0,0,0.02)', border: '1px dashed var(--bdr)',
+                  borderRadius: 6, textAlign: 'center', fontSize: 12, color: 'var(--ink-3)'
+                }}>
+                  No training sessions recorded yet.<br />
+                  <span style={{ fontSize: 11 }}>Run <code>python train_from_dataset.py</code> to generate the first note.</span>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {trainingNotes.map((note, idx) => (
+                    <div key={idx} style={{
+                      border: '1px solid var(--bdr)', borderRadius: 6, padding: 12,
+                      background: idx === 0 ? 'rgba(16,185,129,0.04)' : 'rgba(0,0,0,0.01)'
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                        <div>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink)' }}>📁 {note.source}</span>
+                          {idx === 0 && <span style={{ marginLeft: 8, fontSize: 9, background: 'var(--green)', color: 'white', padding: '1px 6px', borderRadius: 10, fontWeight: 600 }}>LATEST</span>}
+                        </div>
+                        <span style={{ fontSize: 9, fontFamily: 'var(--mono)', color: 'var(--ink-3)' }}>{note.session_id}</span>
+                      </div>
+
+                      {/* Metric cards */}
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 8 }}>
+                        <div style={{ textAlign: 'center', background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 4, padding: '6px 4px' }}>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', fontWeight: 600 }}>IMAGES</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--ink)' }}>{note.images_processed}</div>
+                        </div>
+                        <div style={{ textAlign: 'center', background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 4, padding: '6px 4px' }}>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', fontWeight: 600 }}>EPOCHS</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--ink)' }}>{note.epochs_run ?? '—'}</div>
+                        </div>
+                        <div style={{ textAlign: 'center', background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 4, padding: '6px 4px' }}>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', fontWeight: 600 }}>REWARD Δ</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: note.reward_delta >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                            {note.reward_delta >= 0 ? '+' : ''}{note.reward_delta}%
+                          </div>
+                        </div>
+                        <div style={{ textAlign: 'center', background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 4, padding: '6px 4px' }}>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', fontWeight: 600 }}>ERROR Δ</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: note.error_delta <= 0 ? 'var(--green)' : 'var(--red)' }}>
+                            {note.error_delta >= 0 ? '+' : ''}{note.error_delta}%
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Progress bars */}
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                        <div>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', marginBottom: 2 }}>Reward: {note.avg_reward_before}% → {note.avg_reward_after}%</div>
+                          <div style={{ height: 6, borderRadius: 3, background: 'var(--bdr)', overflow: 'hidden' }}>
+                            <div style={{ height: '100%', width: `${note.avg_reward_after}%`, background: 'var(--green)', borderRadius: 3, transition: 'width 0.5s' }} />
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 9, color: 'var(--ink-3)', marginBottom: 2 }}>Error: {note.avg_error_before}% → {note.avg_error_after}%</div>
+                          <div style={{ height: 6, borderRadius: 3, background: 'var(--bdr)', overflow: 'hidden' }}>
+                            <div style={{ height: '100%', width: `${Math.min(100, note.avg_error_after * 5)}%`, background: note.avg_error_after < 5 ? 'var(--green)' : 'var(--amber)', borderRadius: 3, transition: 'width 0.5s' }} />
+                          </div>
+                        </div>
+                      </div>
+
+                      <p style={{ margin: 0, fontSize: 10, color: 'var(--ink-2)', lineHeight: 1.5, fontStyle: 'italic' }}>{note.notes}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* ── ZIP Dataset Upload Panel ── */}
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--bdr)', borderRadius: 8, padding: 18 }}>
+              <h2 style={{ fontSize: 14, fontWeight: 600, margin: '0 0 6px 0' }}>📂 Upload Forearm Dataset (ZIP)</h2>
+              <p style={{ fontSize: 11, color: 'var(--ink-2)', margin: '0 0 14px 0', lineHeight: 1.5 }}>
+                Upload a COCO-format forearm ZIP dataset. The system will guide you to run the Python trainer which processes the annotations and updates the model.
+              </p>
+
+              <label
+                htmlFor="zip-upload-input"
+                onDragOver={e => { e.preventDefault(); setZipDragOver(true) }}
+                onDragLeave={() => setZipDragOver(false)}
+                onDrop={e => {
+                  e.preventDefault(); setZipDragOver(false)
+                  const file = e.dataTransfer.files[0]
+                  if (file) handleZipFile(file)
+                }}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                  padding: '28px 20px', borderRadius: 8, cursor: 'pointer',
+                  border: `2px dashed ${zipDragOver ? 'var(--accent)' : 'var(--bdr)'}`,
+                  background: zipDragOver ? 'rgba(99,102,241,0.06)' : 'rgba(0,0,0,0.01)',
+                  transition: 'all 0.2s', textAlign: 'center'
+                }}
+              >
+                <div style={{ fontSize: 28, marginBottom: 8 }}>🗜️</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>Drag & drop your forearm dataset ZIP</div>
+                <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 4 }}>or <span style={{ color: 'var(--accent)', textDecoration: 'underline' }}>click to browse</span></div>
+                <div style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 6 }}>Supports: <code>.zip</code> with COCO <code>_annotations.coco.json</code></div>
+                <input
+                  id="zip-upload-input"
+                  type="file"
+                  accept=".zip"
+                  style={{ display: 'none' }}
+                  onChange={e => { const f = e.target.files?.[0]; if (f) handleZipFile(f) }}
+                />
+              </label>
+
+              {zipStatus !== 'idle' && (
+                <div style={{
+                  marginTop: 12, padding: '10px 12px', borderRadius: 6, fontSize: 11,
+                  background: zipStatus === 'error' ? 'var(--red-bg)' : 'rgba(16,185,129,0.07)',
+                  border: `1px solid ${zipStatus === 'error' ? 'var(--red-bdr)' : 'rgba(16,185,129,0.3)'}`,
+                  color: zipStatus === 'error' ? 'var(--red)' : 'var(--ink-2)',
+                  whiteSpace: 'pre-wrap', fontFamily: 'var(--mono)', lineHeight: 1.7
+                }}>
+                  {zipStatus === 'done' && '✅ '}{zipStatus === 'error' && '❌ '}
+                  {zipMessage}
+                </div>
+              )}
+
+              <div style={{ marginTop: 14, padding: '10px 12px', background: 'rgba(0,0,0,0.02)', borderRadius: 6, border: '1px solid var(--bdr)' }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>How to train from your ZIP dataset</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--ink-2)' }}>
+                  <div>1. Extract your ZIP into the project folder <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.07)', padding: '1px 4px', borderRadius: 3 }}>OrthoMeasure-main/</code></div>
+                  <div>2. Run: <code style={{ fontSize: 10, background: 'rgba(0,0,0,0.07)', padding: '1px 4px', borderRadius: 3 }}>python train_from_dataset.py --dataset forearm.coco-segmentation</code></div>
+                  <div>3. The model updates automatically and uploads to Supabase</div>
+                  <div>4. Click <strong>↻ Refresh Notes</strong> above to see your session results</div>
+                </div>
+              </div>
+            </div>
+
           </div>
 
           {/* Sandbox Panel */}
@@ -389,8 +691,12 @@ export default function AIRLManager() {
                   >
                     <option value="Forearm">Forearm</option>
                     <option value="Wrist">Wrist</option>
-                    <option value="Ankle">Ankle</option>
                     <option value="Elbow">Elbow</option>
+                    <option value="Hand">Hand</option>
+                    <option value="Ankle">Ankle</option>
+                    <option value="Foot">Foot</option>
+                    <option value="Knee">Knee</option>
+                    <option value="Shoulder">Shoulder</option>
                   </select>
                 </div>
 

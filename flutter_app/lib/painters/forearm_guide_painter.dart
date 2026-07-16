@@ -11,12 +11,14 @@ class ForearmGuidePainter extends CustomPainter {
   final String currentAngle;
   final double pulsePhase; // 0.0 to 1.0 (from AnimationController)
   final bool isCapturing;
+  final String bodyPart;
 
   ForearmGuidePainter({
     required this.validationScore,
     required this.currentAngle,
     this.pulsePhase = 0.0,
     this.isCapturing = false,
+    this.bodyPart = 'Forearm',
   });
 
   // Lerp colour from deep red → amber → vivid green based on score
@@ -79,11 +81,33 @@ class ForearmGuidePainter extends CustomPainter {
     canvas.drawPath(silhouette, borderPaint);
 
     // ── 3. Zone landmark dots + labels ────────────────────────────────────────
-    final zones = [
-      (Offset(w * 0.5, h * 0.13), 'ELBOW'),
-      (Offset(w * 0.5, h * 0.50), 'MID'),
-      (Offset(w * 0.5, h * 0.85), 'WRIST'),
-    ];
+    List<(Offset, String)> zones;
+    if (bodyPart.toLowerCase() == 'ankle') {
+      zones = [
+        (Offset(w * 0.5, h * 0.15), 'KNEE'),
+        (Offset(w * 0.5, h * 0.50), 'SHIN'),
+        (Offset(w * 0.5, h * 0.85), 'ANKLE'),
+      ];
+    } else if (bodyPart.toLowerCase() == 'wrist') {
+      zones = [
+        (Offset(w * 0.5, h * 0.15), 'FOREARM'),
+        (Offset(w * 0.5, h * 0.50), 'CREASE'),
+        (Offset(w * 0.5, h * 0.85), 'MCP JOINT'),
+      ];
+    } else if (bodyPart.toLowerCase() == 'elbow') {
+      zones = [
+        (Offset(w * 0.5, h * 0.15), 'UPPER ARM'),
+        (Offset(w * 0.5, h * 0.50), 'OLECRANON'),
+        (Offset(w * 0.5, h * 0.85), 'PROX. FOREARM'),
+      ];
+    } else {
+      // Forearm default
+      zones = [
+        (Offset(w * 0.5, h * 0.13), 'ELBOW'),
+        (Offset(w * 0.5, h * 0.50), 'MID'),
+        (Offset(w * 0.5, h * 0.85), 'WRIST'),
+      ];
+    }
 
     final labelStyle = TextStyle(
       color: color.withValues(alpha: 0.9),

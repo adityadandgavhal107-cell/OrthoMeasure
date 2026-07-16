@@ -1,9 +1,9 @@
 import os
-import re
 import sys
 import json
 import time
 import math
+import argparse
 import urllib.request
 import numpy as np
 
@@ -20,49 +20,80 @@ class LandmarkRLModel:
         self.reset_weights()
 
     def reset_weights(self):
-        # Small weights: starts near zero offsets (relying on default fallback)
-        self.W1 = np.random.randn(self.input_dim, self.hidden_1) * 0.01
+        # He initialization for hidden layers
+        self.W1 = np.random.randn(self.input_dim, self.hidden_1) * np.sqrt(2. / self.input_dim)
         self.b1 = np.zeros((1, self.hidden_1))
-        self.W2 = np.random.randn(self.hidden_1, self.hidden_2) * 0.01
+        self.W2 = np.random.randn(self.hidden_1, self.hidden_2) * np.sqrt(2. / self.hidden_1)
         self.b2 = np.zeros((1, self.hidden_2))
-        self.W3 = np.random.randn(self.hidden_2, self.output_dim) * 0.01
+        # Output layer at zero — untrained inputs predict 0 offset (= anatomical default)
+        self.W3 = np.zeros((self.hidden_2, self.output_dim))
         self.b3 = np.zeros((1, self.output_dim))
+        # Adam optimiser moments (initialised alongside weights)
+        self._init_adam()
+
+    def _init_adam(self):
+        """Reset first/second moment buffers for Adam."""
+        self.mW1 = np.zeros_like(self.W1); self.vW1 = np.zeros_like(self.W1)
+        self.mb1 = np.zeros_like(self.b1); self.vb1 = np.zeros_like(self.b1)
+        self.mW2 = np.zeros_like(self.W2); self.vW2 = np.zeros_like(self.W2)
+        self.mb2 = np.zeros_like(self.b2); self.vb2 = np.zeros_like(self.b2)
+        self.mW3 = np.zeros_like(self.W3); self.vW3 = np.zeros_like(self.W3)
+        self.mb3 = np.zeros_like(self.b3); self.vb3 = np.zeros_like(self.b3)
+        self.adam_t = 0  # global step counter
 
     def forward(self, X):
-        self.h1 = np.maximum(0, np.dot(X, self.W1) + self.b1) # ReLU
-        self.h2 = np.maximum(0, np.dot(self.h1, self.W2) + self.b2) # ReLU
-        out = np.dot(self.h2, self.W3) + self.b3
-        return out
+        self.h1 = np.maximum(0, np.dot(X, self.W1) + self.b1)  # ReLU
+        self.h2 = np.maximum(0, np.dot(self.h1, self.W2) + self.b2)  # ReLU
+        return np.dot(self.h2, self.W3) + self.b3
 
-    def backward(self, X, out, target, lr=0.02):
+    def backward(self, X, out, target, lr=0.001):
+        """Adam-based gradient update. lr is the base learning rate."""
         N = X.shape[0]
         grad_out = (out - target) / N
-        
+
         dW3 = np.dot(self.h2.T, grad_out)
         db3 = np.sum(grad_out, axis=0, keepdims=True)
-        
+
         grad_h2 = np.dot(grad_out, self.W3.T)
         grad_h2[self.h2 <= 0] = 0
-        
+
         dW2 = np.dot(self.h1.T, grad_h2)
         db2 = np.sum(grad_h2, axis=0, keepdims=True)
-        
+
         grad_h1 = np.dot(grad_h2, self.W2.T)
         grad_h1[self.h1 <= 0] = 0
-        
+
         dW1 = np.dot(X.T, grad_h1)
         db1 = np.sum(grad_h1, axis=0, keepdims=True)
-        
-        # Gradient clip
+
+        # Very small L2 to prevent exploding weights without crushing signal
+        l2_lambda = 0.0001
+        dW3 += l2_lambda * self.W3
+        dW2 += l2_lambda * self.W2
+        dW1 += l2_lambda * self.W1
+
+        # Gradient clip (prevent extreme spikes in early epochs)
         for grad in [dW1, db1, dW2, db2, dW3, db3]:
-            np.clip(grad, -10.0, 10.0, out=grad)
-            
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-        self.W3 -= lr * dW3
-        self.b3 -= lr * db3
+            np.clip(grad, -5.0, 5.0, out=grad)
+
+        # Adam update (beta1=0.9, beta2=0.999, eps=1e-8)
+        self.adam_t += 1
+        t = self.adam_t
+        b1, b2, eps = 0.9, 0.999, 1e-8
+
+        def adam_step(param, grad, m, v):
+            m[:] = b1 * m + (1 - b1) * grad
+            v[:] = b2 * v + (1 - b2) * (grad ** 2)
+            m_hat = m / (1 - b1 ** t)
+            v_hat = v / (1 - b2 ** t)
+            param -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+        adam_step(self.W1, dW1, self.mW1, self.vW1)
+        adam_step(self.b1, db1, self.mb1, self.vb1)
+        adam_step(self.W2, dW2, self.mW2, self.vW2)
+        adam_step(self.b2, db2, self.mb2, self.vb2)
+        adam_step(self.W3, dW3, self.mW3, self.vW3)
+        adam_step(self.b3, db3, self.mb3, self.vb3)
 
     def to_dict(self):
         return {
@@ -81,64 +112,82 @@ class LandmarkRLModel:
         self.b2 = np.array(d["b2"])
         self.W3 = np.array(d["W3"])
         self.b3 = np.array(d["b3"])
+        # Re-init Adam moments to match loaded weight shapes
+        self._init_adam()
 
 # Helper to resolve default starting coordinates for a body part
 def get_default_landmarks(body_part):
-    if body_part == 'Forearm':
-        return [50.0, 18.0, 50.0, 50.0, 50.0, 82.0]
-    elif body_part == 'Wrist':
-        return [50.0, 25.0, 50.0, 50.0, 50.0, 75.0]
-    elif body_part == 'Ankle':
-        return [50.0, 22.0, 50.0, 62.0, 50.0, 82.0]
-    else: # Elbow / other
-        return [50.0, 25.0, 50.0, 52.0, 50.0, 75.0]
+    # [proximal_x, proximal_y, mid_x, mid_y, distal_x, distal_y]
+    DEFAULTS = {
+        'Forearm':  [50.0, 18.0, 50.0, 50.0, 50.0, 82.0],
+        'Wrist':    [50.0, 25.0, 50.0, 50.0, 50.0, 75.0],
+        'Elbow':    [50.0, 25.0, 50.0, 52.0, 50.0, 75.0],
+        'Hand':     [50.0, 20.0, 50.0, 50.0, 50.0, 80.0],
+        'Ankle':    [50.0, 22.0, 50.0, 62.0, 50.0, 82.0],
+        'Foot':     [50.0, 18.0, 50.0, 50.0, 50.0, 82.0],
+        'Knee':     [50.0, 18.0, 50.0, 50.0, 50.0, 82.0],
+        'Shoulder': [50.0, 20.0, 50.0, 50.0, 50.0, 80.0],
+    }
+    return DEFAULTS.get(body_part, DEFAULTS['Forearm'])
 
 # Build State Vector from Patient case profile + Image view angle
+# State is 23 dimensions:
+#   0       : age (normalised)
+#   1-3     : gender (M, F, Other)
+#   4-5     : side (Left, Right)
+#   6-9     : body part (Forearm, Wrist, Ankle, Elbow/Other)
+#   10-12   : mobility (Normal, Limited, None)
+#   13-16   : swelling (Normal, Mild, Moderate, Severe)
+#   17-22   : view angle (Front, Back, Left, Right, 45°L, 45°R)
 def build_state_vector(case, angle):
     state = np.zeros(23)
-    
+
     # 0: Age (normalized)
     age = case.get('patient_age', 35)
     if age is None: age = 35
     state[0] = float(age) / 100.0
-    
+
     # 1-3: Gender (M, F, Other)
     gender = case.get('patient_gender', 'M')
     if gender == 'M': state[1] = 1.0
     elif gender == 'F': state[2] = 1.0
     else: state[3] = 1.0
-    
+
     # 4-5: Side (Left, Right)
     side = case.get('side', 'Left')
     if side == 'Left': state[4] = 1.0
     else: state[5] = 1.0
-    
-    # 6-9: Body Part (Forearm, Wrist, Ankle, Elbow)
+
+    # 6-9: Body Part (matches Flutter landmark_editor.dart)
     part = case.get('body_part', 'Forearm')
-    if part == 'Forearm': state[6] = 1.0
-    elif part == 'Wrist': state[7] = 1.0
-    elif part == 'Ankle': state[8] = 1.0
-    else: state[9] = 1.0
-    
+    if part == 'Forearm':
+        state[6] = 1.0
+    elif part == 'Wrist':
+        state[7] = 1.0
+    elif part == 'Ankle':
+        state[8] = 1.0
+    else:
+        state[9] = 1.0 # Elbow, Hand, Foot, Knee, Shoulder
+
     # 10-12: Mobility (Normal, Limited, None)
     mobility = case.get('mobility_status', 'Normal')
     if mobility == 'Normal': state[10] = 1.0
     elif mobility == 'Limited': state[11] = 1.0
     else: state[12] = 1.0
-    
+
     # 13-16: Swelling (Normal, Mild, Moderate, Severe)
     swelling = case.get('swelling_status', 'Normal')
     if swelling == 'Normal': state[13] = 1.0
     elif swelling == 'Mild': state[14] = 1.0
     elif swelling == 'Moderate': state[15] = 1.0
     else: state[16] = 1.0
-    
-    # 17-22: Angle
+
+    # 17-22: Angle (6 views)
     angles_list = ['Front', 'Back', 'Left', 'Right', '45° Left', '45° Right']
     if angle in angles_list:
         idx = angles_list.index(angle)
         state[17 + idx] = 1.0
-        
+
     return state
 
 # Parse landmarks from case image structure
@@ -154,6 +203,117 @@ def get_landmarks_coordinates(landmarks_dict):
         return [px, py, mx, my, dx, dy]
     except Exception:
         return None
+
+# Approximate adult baselines (cm)
+def get_default_measurements(body_part):
+    DEFAULTS = {
+        'Forearm': {
+            'total length':        25.0,
+            'proximal width':       9.0,
+            'distal width':         6.5,
+            'mid circumference':   22.8,
+            'wrist circumference': 16.5
+        },
+        'Wrist': {
+            'total length':        12.0,
+            'proximal width':       6.5,
+            'distal width':         5.0,
+            'mid circumference':   16.5,
+            'wrist circumference': 16.5
+        },
+        'Elbow': {
+            'total length':        14.0,
+            'proximal width':      10.5,
+            'distal width':         8.5,
+            'mid circumference':   28.6,
+            'wrist circumference': 22.4
+        },
+        'Hand': {
+            'total length':        18.0,
+            'proximal width':       7.0,
+            'distal width':         9.0,
+            'mid circumference':   19.5,
+            'wrist circumference': 16.5
+        },
+        'Ankle': {
+            'total length':        20.0,
+            'proximal width':      10.0,
+            'distal width':         8.0,
+            'mid circumference':   25.0,
+            'wrist circumference': 22.0
+        },
+        'Foot': {
+            'total length':        22.0,
+            'proximal width':       9.5,
+            'distal width':        10.5,
+            'mid circumference':   22.0,
+            'wrist circumference': 24.0
+        },
+        'Knee': {
+            'total length':        25.0,
+            'proximal width':      14.0,
+            'distal width':        11.5,
+            'mid circumference':   38.0,
+            'wrist circumference': 31.0
+        },
+        'Shoulder': {
+            'total length':        20.0,
+            'proximal width':      13.0,
+            'distal width':        11.0,
+            'mid circumference':   35.0,
+            'wrist circumference': 29.0
+        },
+    }
+    return DEFAULTS.get(body_part, DEFAULTS['Forearm'])
+
+def adjust_targets_for_manual_measurements(coords, manual_measurements, body_part):
+    if not manual_measurements:
+        return coords
+        
+    defaults = get_default_measurements(body_part)
+    new_coords = list(coords)
+    
+    # [px, py, mx, my, dx, dy] = [0, 1, 2, 3, 4, 5]
+    
+    # 1. Total Length (changes distal Y)
+    length_meas = next((m for m in manual_measurements if 'length' in m.get('key', '').lower()), None)
+    if length_meas and length_meas.get('manualValue'):
+        try:
+            actual_val = float(length_meas['manualValue'])
+            default_val = defaults.get('total length', 25.0)
+            ratio = actual_val / default_val
+            base_dist = 64.0 # 82 - 18
+            target_dist = base_dist * ratio
+            new_coords[5] = new_coords[1] + target_dist
+        except ValueError:
+            pass
+            
+    # 2. Proximal Width (changes proximal X)
+    prox_meas = next((m for m in manual_measurements if 'proximal width' in m.get('key', '').lower()), None)
+    if prox_meas and prox_meas.get('manualValue'):
+        try:
+            actual_val = float(prox_meas['manualValue'])
+            default_val = defaults.get('proximal width', 9.0)
+            ratio = actual_val / default_val
+            dx = (ratio * 25.0) - 25.0
+            # Base is 50. We shift it by dx. Let's say right shift:
+            new_coords[0] = 50.0 + dx
+        except ValueError:
+            pass
+
+    # 3. Distal Width (changes distal X)
+    dist_meas = next((m for m in manual_measurements if 'distal width' in m.get('key', '').lower()), None)
+    if dist_meas and dist_meas.get('manualValue'):
+        try:
+            actual_val = float(dist_meas['manualValue'])
+            default_val = defaults.get('distal width', 6.5)
+            ratio = actual_val / default_val
+            dx = (ratio * 25.0) - 25.0
+            new_coords[4] = 50.0 + dx
+        except ValueError:
+            pass
+            
+    return new_coords
 
 # Load credentials from .env
 def load_env_credentials():
@@ -251,7 +411,7 @@ class ModelManager:
         except Exception as e:
             print("Error saving model state:", e)
 
-    def train_on_case(self, case):
+    def train_on_case(self, case, epoch_log_only=False):
         case_id = case.get('id')
         body_part = case.get('body_part', 'Forearm')
         images = case.get('images', [])
@@ -274,9 +434,13 @@ class ModelManager:
             if not doctor_coords:
                 continue
                 
+            # Use manual measurements to override targets if present
+            measurements = case.get('measurements', [])
+            final_coords = adjust_targets_for_manual_measurements(doctor_coords, measurements, body_part)
+                
             # Inputs/Outputs
             X = build_state_vector(case, angle).reshape(1, -1)
-            target_offsets = np.array(doctor_coords) - np.array(default_landmarks)
+            target_offsets = np.array(final_coords) - np.array(default_landmarks)
             
             # Predict
             pred_offsets = self.model.forward(X).flatten()
@@ -314,28 +478,32 @@ class ModelManager:
             if case_id not in self.trained_cases:
                 self.trained_cases.append(case_id)
                 
-            # Log history
-            log_entry = {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "case_id": case_id,
-                "reward": round(float(avg_reward), 2),
-                "loss": round(float(avg_loss), 4),
-                "avg_error_pct": round(float(avg_err), 2)
-            }
-            self.training_history.append(log_entry)
+            # Log history less aggressively
+            if len(self.training_history) < 100 or epoch_log_only:
+                log_entry = {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "case_id": case_id,
+                    "reward": round(float(avg_reward), 2),
+                    "loss": round(float(avg_loss), 4),
+                    "avg_error_pct": round(float(avg_err), 2)
+                }
+                self.training_history.append(log_entry)
             
             # Recompute global stats
-            all_rewards = [h["reward"] for h in self.training_history]
-            all_errors = [h["avg_error_pct"] for h in self.training_history]
+            if len(self.training_history) > 0:
+                all_rewards = [h["reward"] for h in self.training_history[-100:]]
+                all_errors = [h["avg_error_pct"] for h in self.training_history[-100:]]
+            else:
+                all_rewards = [avg_reward]
+                all_errors = [avg_err]
+                
             self.stats = {
                 "total_trained": len(self.trained_cases),
-                "current_avg_reward": round(float(np.mean(all_rewards)), 2) if all_rewards else 100.0,
-                "current_avg_error": round(float(np.mean(all_errors)), 2) if all_errors else 0.0
+                "current_avg_reward": round(float(np.mean(all_rewards)), 2),
+                "current_avg_error": round(float(np.mean(all_errors)), 2)
             }
-            
-            print(f"[{time.strftime('%H:%M:%S')}] Trained on Case {case_id} ({body_part}). Reward: {log_entry['reward']} | Error: {log_entry['avg_error_pct']}%")
-            return True
-        return False
+            return True, avg_err
+        return False, 0.0
 
     def train_all_approved(self):
         print("Querying Supabase for approved cases to train the model...")
@@ -343,18 +511,43 @@ class ModelManager:
         approved_cases = [c for c in cases if c.get('status') == 'approved']
         print(f"Found {len(approved_cases)} approved cases in database.")
         
+        if not approved_cases:
+            print("No cases with completed landmark mappings were available for training.")
+            return
+
         trained_count = 0
-        for case in approved_cases:
-            # We train on all approved cases to refine model, even if trained before (epochs)
-            success = self.train_on_case(case)
-            if success:
-                trained_count += 1
+        epochs = 1000
+        tolerance = 0.5 # Stop if average error % is below 0.5%
+        
+        for epoch in range(epochs):
+            epoch_errors = []
+            trained_in_epoch = False
+            for case in approved_cases:
+                # We train on all approved cases to refine model
+                success, err = self.train_on_case(case, epoch_log_only=(epoch % 50 != 0))
+                if success:
+                    epoch_errors.append(err)
+                    trained_in_epoch = True
+                    if epoch == 0:
+                        trained_count += 1
+            
+            if not trained_in_epoch:
+                break
+                
+            # Check convergence
+            current_error = np.mean(epoch_errors) if epoch_errors else 100.0
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}: current_avg_error = {current_error:.2f}%")
+                
+            if current_error < tolerance:
+                print(f"Converged at epoch {epoch} with error {current_error:.2f}%")
+                break
                 
         if trained_count > 0:
             self.save_model()
             print(f"Model training cycle complete. Trained on {trained_count} cases.")
         else:
-            print("No cases with completed landmark mappings were available for training.")
+            print("No new training happened.")
 
     def run_daemon(self):
         print(f"AI RL Agent Daemon started. Listening for approved cases every {POLL_INTERVAL_SECONDS} seconds...")
@@ -377,20 +570,21 @@ class ModelManager:
             time.sleep(POLL_INTERVAL_SECONDS)
 
 if __name__ == '__main__':
-    # Parse arguments
+    parser = argparse.ArgumentParser(description='RL Landmark Model Manager')
+    parser.add_argument('--daemon', action='store_true', help='Run in daemon mode')
+    parser.add_argument('--train-all', action='store_true', help='Train on all approved cases in Supabase')
+    parser.add_argument('--reset', action='store_true', help='Reset weights using He initialization')
+    args = parser.parse_args()
+    
     url, key = load_env_credentials()
     if not url or not key:
         print("Error: Could not load VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY from .env file.")
         sys.exit(1)
         
-    cmd = "--train-all"
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-        
     manager = ModelManager(url, key)
     
-    if cmd == "--reset":
-        print("Resetting model parameters...")
+    if args.reset:
+        print("Resetting model parameters to He initialization...")
         manager.model.reset_weights()
         manager.trained_cases = []
         manager.training_history = []
@@ -401,15 +595,14 @@ if __name__ == '__main__':
         }
         manager.save_model()
         print("Model parameters reset successfully.")
+    
+    if args.train_all:
+        manager.train_all_approved()
         
-    elif cmd == "--daemon":
+    elif args.daemon:
         # Force a pre-training check of all approved cases on boot
         manager.train_all_approved()
         manager.run_daemon()
         
-    elif cmd == "--train-all":
-        manager.train_all_approved()
-        
-    else:
-        print(f"Unknown command: {cmd}")
+    elif not args.reset:
         print("Usage: python rl_agent.py [--train-all | --daemon | --reset]")

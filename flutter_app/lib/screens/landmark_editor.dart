@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../services/supabase_service.dart';
+import '../config/body_part_config.dart';
 
 class LandmarkEditor extends StatefulWidget {
   final String authToken;
@@ -71,33 +72,11 @@ class _LandmarkEditorState extends State<LandmarkEditor>
   }
 
   void _initializeLandmarks() {
-    final bodyPart = widget.orthoCase['bodyPart'] ?? 'Wrist';
-
-    if (bodyPart == 'Forearm') {
-      _landmarks = {
-        'proximal': {'label': 'Elbow Crease', 'x': 50.0, 'y': 18.0, 'color': 0xFFEF4444},
-        'mid': {'label': 'Mid Forearm', 'x': 50.0, 'y': 50.0, 'color': 0xFFF59E0B},
-        'distal': {'label': 'Wrist Joint', 'x': 50.0, 'y': 82.0, 'color': 0xFF10B981},
-      };
-    } else if (bodyPart == 'Wrist') {
-      _landmarks = {
-        'proximal': {'label': 'Distal Forearm', 'x': 50.0, 'y': 25.0, 'color': 0xFFEF4444},
-        'mid': {'label': 'Wrist Crease', 'x': 50.0, 'y': 50.0, 'color': 0xFFF59E0B},
-        'distal': {'label': 'MCP Joint', 'x': 50.0, 'y': 75.0, 'color': 0xFF10B981},
-      };
-    } else if (bodyPart == 'Ankle') {
-      _landmarks = {
-        'proximal': {'label': 'Calf Base', 'x': 50.0, 'y': 22.0, 'color': 0xFFEF4444},
-        'mid': {'label': 'Lateral Malleolus', 'x': 50.0, 'y': 62.0, 'color': 0xFFF59E0B},
-        'distal': {'label': 'Heel Base', 'x': 50.0, 'y': 82.0, 'color': 0xFF10B981},
-      };
-    } else {
-      _landmarks = {
-        'proximal': {'label': 'Upper Arm', 'x': 50.0, 'y': 25.0, 'color': 0xFFEF4444},
-        'mid': {'label': 'Olecranon', 'x': 50.0, 'y': 52.0, 'color': 0xFFF59E0B},
-        'distal': {'label': 'Prox. Forearm', 'x': 50.0, 'y': 75.0, 'color': 0xFF10B981},
-      };
-    }
+    // All body-part landmark definitions live in body_part_config.dart.
+    // getLandmarkEditorDefs() is case-insensitive and covers every supported
+    // body part (forearm, wrist, elbow, hand, ankle, foot, knee, shoulder).
+    final bodyPart = widget.orthoCase['bodyPart']?.toString() ?? 'Forearm';
+    _landmarks = getLandmarkEditorDefs(bodyPart);
   }
 
   Future<void> _loadAndApplyAIPredictions() async {

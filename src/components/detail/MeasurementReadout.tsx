@@ -46,7 +46,8 @@ export default function MeasurementReadout({ measurements, bodyPart, side, onMan
         <>
           {measurements.map((m, i) => {
             const hasManual = m.manualValue !== undefined
-            const deviation = hasManual ? Math.abs(m.value - m.manualValue!) / m.value : 0
+            // Calculate deviation based on actual ground-truth manual measurement
+            const deviation = hasManual ? Math.abs(m.value - m.manualValue!) / (m.manualValue! || m.value || 1) : 0
             const isWarning = deviation > 0.10
             
             // Calculate display confidence based on deviation if manual value exists
@@ -54,18 +55,29 @@ export default function MeasurementReadout({ measurements, bodyPart, side, onMan
               ? Math.max(0, Math.round((1 - deviation) * 100))
               : m.confidence
 
+            const delta = hasManual ? (m.value - m.manualValue!) : 0
+            const deltaText = delta > 0 ? `+${delta.toFixed(1)}` : delta.toFixed(1)
+            const deltaColor = delta === 0 ? 'var(--ink-3)' : isWarning ? 'var(--red)' : 'var(--accent)'
+
             return (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
                 <div style={{ fontSize: 11, color: 'var(--ink-3)', width: 90, flexShrink: 0, lineHeight: 1.2 }}>{m.key}</div>
                 
                 {/* AI Value */}
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-                  <div style={{ display: 'flex', alignItems: 'baseline' }}>
-                    <span style={{ fontSize: 9, color: 'var(--ink-3)', textTransform: 'uppercase', marginRight: 4 }}>AI:</span>
-                    <span style={{ fontFamily: 'var(--mono)', fontSize: 15, fontWeight: 600, color: 'var(--ink)', letterSpacing: '-0.02em' }}>
-                      {m.value.toFixed(1)}
-                    </span>
-                    <span style={{ fontFamily: 'inherit', fontSize: 10, color: 'var(--ink-3)', marginLeft: 2 }}>{m.unit}</span>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'baseline' }}>
+                      <span style={{ fontSize: 9, color: 'var(--ink-3)', textTransform: 'uppercase', marginRight: 4 }}>AI:</span>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 15, fontWeight: 600, color: 'var(--ink)', letterSpacing: '-0.02em' }}>
+                        {m.value.toFixed(1)}
+                      </span>
+                      <span style={{ fontFamily: 'inherit', fontSize: 10, color: 'var(--ink-3)', marginLeft: 2 }}>{m.unit}</span>
+                    </div>
+                    {hasManual && delta !== 0 && (
+                      <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: deltaColor, fontWeight: 500 }}>
+                        ({deltaText})
+                      </span>
+                    )}
                   </div>
                   <Ruler />
                 </div>

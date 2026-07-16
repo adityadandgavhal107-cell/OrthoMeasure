@@ -5,38 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
-import '../painters/forearm_guide_painter.dart';
+import 'package:opencv_dart/opencv_dart.dart' as cv;
+import '../config/body_part_config.dart';
+import '../painters/body_part_guide_painter.dart';
 import '../services/supabase_service.dart';
 import 'landmark_editor.dart';
 import '../main.dart';
-
-// ─── Per-angle scan instructions ────────────────────────────────────────────
-const Map<String, Map<String, String>> _angleInstructions = {
-  'Front': {
-    'title': 'ANTERIOR VIEW',
-    'body': 'Hold palm facing UP (supinated). Wrist at bottom, elbow at top.',
-  },
-  'Back': {
-    'title': 'POSTERIOR VIEW',
-    'body': 'Flip arm — palm facing DOWN (pronated). Keep elbow in frame.',
-  },
-  'Left': {
-    'title': 'LATERAL VIEW',
-    'body': 'Rotate arm so thumb side faces the camera. Keep forearm vertical.',
-  },
-  'Right': {
-    'title': 'MEDIAL VIEW',
-    'body': 'Rotate arm so pinky side faces camera. Forearm upright, centred.',
-  },
-  '45° Left': {
-    'title': '45° OBLIQUE — LEFT',
-    'body': 'Rotate halfway between front and left. Thumb facing upper-left.',
-  },
-  '45° Right': {
-    'title': '45° OBLIQUE — RIGHT',
-    'body': 'Rotate halfway between front and right. Pinky facing upper-right.',
-  },
-};
 
 class ScanScreen extends StatefulWidget {
   final String authToken;
@@ -60,38 +34,37 @@ class _ScanScreenState extends State<ScanScreen>
   bool _isProcessingFrame = false;
   DateTime _lastAnalysisTime = DateTime.now();
 
-  final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
+  final PoseDetector _poseDetector =
+      PoseDetector(options: PoseDetectorOptions());
 
-  // ── Workflow state ────────────────────────────────────────────────────────
+  // ── Workflow state ─────────────────────────────────────────────────────────
   int _currentStep = 0;
   final List<String> _angles = [
     'Front', 'Back', 'Left', 'Right', '45° Left', '45° Right'
   ];
   final List<Map<String, dynamic>> _capturedViews = [];
   bool _isCapturing = false;
-  bool _isNavigating = false; // guard against double navigation
+  bool _isNavigating = false;
 
-  // ── Auto-validation ───────────────────────────────────────────────────────
-  /// 0.0 = not aligned, 1.0 = fully validated, ready to capture
+  // ── Auto-validation ────────────────────────────────────────────────────────
   double _validationScore = 0.0;
-
-  /// How many consecutive frames passed all checks
   int _stableFrameCount = 0;
+  static const int _kStableFramesRequired = 3;
 
-  /// Frames needed before auto-capture fires
-  static const int _kStableFramesRequired = 10; // Increased to prevent premature capture
-
-  Timer? _analysisTimer;
   Timer? _autoCaptureTimer;
 
-  // ── Animations ────────────────────────────────────────────────────────────
+  // ── Animations ─────────────────────────────────────────────────────────────
   late AnimationController _pulseController;
   late AnimationController _countdownController;
   late Animation<double> _countdownAnimation;
 
-  // ── Status text ──────────────────────────────────────────────────────────
-  String _statusMessage = 'Position the forearm inside the guide frame';
+  // ── Status text ────────────────────────────────────────────────────────────
+  String _statusMessage = 'Position the limb inside the guide frame';
   Color _statusColor = const Color(0xFFEF4444);
+
+  // ── Derived config (refreshed on each step) ────────────────────────────────
+  BodyPartConfig get _config =>
+      getBodyPartConfig(widget.orthoCase['bodyPart']?.toString() ?? 'Forearm');
 
   @override
   void initState() {
@@ -111,15 +84,16 @@ class _ScanScreenState extends State<ScanScreen>
       curve: Curves.easeInOut,
     );
 
+    _statusMessage = _config.initialPositionMessage;
     _initializeCamera();
   }
 
   @override
   void dispose() {
-    _analysisTimer?.cancel();
     _autoCaptureTimer?.cancel();
     _poseDetector.close();
-    if (_cameraController != null && _cameraController!.value.isStreamingImages) {
+    if (_cameraController != null &&
+        _cameraController!.value.isStreamingImages) {
       _cameraController!.stopImageStream();
     }
     _cameraController?.dispose();
@@ -128,7 +102,7 @@ class _ScanScreenState extends State<ScanScreen>
     super.dispose();
   }
 
-  // ── Camera init ───────────────────────────────────────────────────────────
+  // ── Camera init ────────────────────────────────────────────────────────────
   Future<void> _initializeCamera() async {
     final status = await Permission.camera.request();
     if (status != PermissionStatus.granted) {
@@ -144,7 +118,6 @@ class _ScanScreenState extends State<ScanScreen>
       return;
     }
 
-    // Fetch cameras if not already loaded
     if (cameras.isEmpty) {
       try {
         cameras = await availableCameras();
@@ -191,17 +164,21 @@ class _ScanScreenState extends State<ScanScreen>
     }
   }
 
-  // ── Real-time camera frame stream analysis (Skin & Alignment Detection) ────
+  // ── Frame analysis stream ──────────────────────────────────────────────────
   void _startFrameAnalysisStream() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    if (_cameraController == null ||
+        !_cameraController!.value.isInitialized) {
+      return;
+    }
 
     _stableFrameCount = 0;
     _validationScore = 0.0;
     _isProcessingFrame = false;
 
     _cameraController!.startImageStream((CameraImage image) {
-      if (!mounted || _isCapturing || _isNavigating || _isProcessingFrame) return;
-
+      if (!mounted || _isCapturing || _isNavigating || _isProcessingFrame) {
+        return;
+      }
       _isProcessingFrame = true;
       _analyzeFrame(image);
     });
@@ -223,22 +200,34 @@ class _ScanScreenState extends State<ScanScreen>
         orElse: () => cameras.first,
       );
 
+      // ── Rotation ────────────────────────────────────────────────────────
       final sensorOrientation = camera.sensorOrientation;
       InputImageRotation? rotation;
       if (Platform.isIOS) {
-        rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
+        rotation =
+            InputImageRotationValue.fromRawValue(sensorOrientation);
       } else if (Platform.isAndroid) {
         var rotationCompensation = 0;
         switch (_cameraController!.value.deviceOrientation) {
-          case DeviceOrientation.portraitUp: rotationCompensation = 0; break;
-          case DeviceOrientation.landscapeLeft: rotationCompensation = 90; break;
-          case DeviceOrientation.portraitDown: rotationCompensation = 180; break;
-          case DeviceOrientation.landscapeRight: rotationCompensation = 270; break;
+          case DeviceOrientation.portraitUp:
+            rotationCompensation = 0;
+            break;
+          case DeviceOrientation.landscapeLeft:
+            rotationCompensation = 90;
+            break;
+          case DeviceOrientation.portraitDown:
+            rotationCompensation = 180;
+            break;
+          case DeviceOrientation.landscapeRight:
+            rotationCompensation = 270;
+            break;
         }
         if (camera.lensDirection == CameraLensDirection.front) {
-          rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
+          rotationCompensation =
+              (sensorOrientation + rotationCompensation) % 360;
         } else {
-          rotationCompensation = (sensorOrientation - rotationCompensation + 360) % 360;
+          rotationCompensation =
+              (sensorOrientation - rotationCompensation + 360) % 360;
         }
         rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
       }
@@ -248,6 +237,7 @@ class _ScanScreenState extends State<ScanScreen>
         return;
       }
 
+      // ── Format check ─────────────────────────────────────────────────────
       final format = InputImageFormatValue.fromRawValue(image.format.raw);
       if (format == null ||
           (Platform.isAndroid && format != InputImageFormat.nv21) ||
@@ -261,6 +251,7 @@ class _ScanScreenState extends State<ScanScreen>
         return;
       }
 
+      // ── Build InputImage ──────────────────────────────────────────────────
       final WriteBuffer allBytes = WriteBuffer();
       for (final Plane plane in image.planes) {
         allBytes.putUint8List(plane.bytes);
@@ -277,8 +268,27 @@ class _ScanScreenState extends State<ScanScreen>
         ),
       );
 
+      // ── Pose detection ────────────────────────────────────────────────────
       final List<Pose> poses = await _poseDetector.processImage(inputImage);
 
+      // ── ArUco marker detection ─────────────────────────────────────────────
+      bool markerFound = false;
+      try {
+        final grayMat = cv.Mat.fromList(
+            image.height, image.width, cv.MatType.CV_8UC1,
+            image.planes[0].bytes);
+        final dictionary = cv.ArucoDictionary.predefined(
+            cv.PredefinedDictionaryType.DICT_4X4_50);
+        final params = cv.ArucoDetectorParameters.empty();
+        final detector = cv.ArucoDetector.create(dictionary, params);
+        final (corners, ids, rejected) = detector.detectMarkers(grayMat);
+        if (ids.isNotEmpty) markerFound = true;
+        grayMat.dispose();
+      } catch (e) {
+        debugPrint('ArUco detection error: $e');
+      }
+
+      // ── Validate joints against body-part config ──────────────────────────
       double nextScore = _validationScore;
       String msg = _statusMessage;
       Color col = _statusColor;
@@ -289,20 +299,42 @@ class _ScanScreenState extends State<ScanScreen>
         col = const Color(0xFFEF4444);
       } else {
         final pose = poses.first;
-        final leftWrist = pose.landmarks[PoseLandmarkType.leftWrist];
-        final rightWrist = pose.landmarks[PoseLandmarkType.rightWrist];
-        final leftElbow = pose.landmarks[PoseLandmarkType.leftElbow];
-        final rightElbow = pose.landmarks[PoseLandmarkType.rightElbow];
+        final config = _config;
 
-        final hasValidWrist = (leftWrist != null && leftWrist.likelihood > 0.6) || 
-                              (rightWrist != null && rightWrist.likelihood > 0.6);
-        final hasValidElbow = (leftElbow != null && leftElbow.likelihood > 0.6) || 
-                              (rightElbow != null && rightElbow.likelihood > 0.6);
+        // Check all required landmark types — need at least ONE pair present.
+        // Required types are stored as [leftA, rightA, leftB, rightB], so we
+        // check: (leftA OR rightA) AND (leftB OR rightB)
+        final types = config.requiredLandmarkTypes;
+        bool hasValidJoints = false;
 
-        if (!hasValidWrist || !hasValidElbow) {
+        if (types.length >= 4) {
+          final landmark0 = pose.landmarks[types[0]];
+          final landmark1 = pose.landmarks[types[1]];
+          final landmark2 = pose.landmarks[types[2]];
+          final landmark3 = pose.landmarks[types[3]];
+
+          final groupA = (landmark0 != null && landmark0.likelihood > 0.55) ||
+              (landmark1 != null && landmark1.likelihood > 0.55);
+          final groupB = (landmark2 != null && landmark2.likelihood > 0.55) ||
+              (landmark3 != null && landmark3.likelihood > 0.55);
+
+          hasValidJoints = groupA && groupB;
+        } else if (types.length == 2) {
+          final landmark0 = pose.landmarks[types[0]];
+          final landmark1 = pose.landmarks[types[1]];
+          hasValidJoints =
+              (landmark0 != null && landmark0.likelihood > 0.55) ||
+              (landmark1 != null && landmark1.likelihood > 0.55);
+        }
+
+        if (!hasValidJoints) {
           nextScore = (nextScore - 0.10).clamp(0.0, 1.0);
-          msg = 'Ensure both wrist and elbow are visible';
+          msg = config.validationFailMessage;
           col = const Color(0xFFF59E0B);
+        } else if (!markerFound) {
+          nextScore = (nextScore - 0.15).clamp(0.0, 1.0);
+          msg = 'Limb detected. Show 50×50 mm ArUco marker in frame.';
+          col = const Color(0xFFEF4444);
         } else {
           nextScore = (nextScore + 0.15).clamp(0.0, 1.0);
           if (nextScore < 0.4) {
@@ -328,14 +360,17 @@ class _ScanScreenState extends State<ScanScreen>
         });
       }
 
-      if (_stableFrameCount >= _kStableFramesRequired && !_isCapturing && !_isNavigating) {
-        if (_cameraController != null && _cameraController!.value.isStreamingImages) {
+      if (_stableFrameCount >= _kStableFramesRequired &&
+          !_isCapturing &&
+          !_isNavigating) {
+        if (_cameraController != null &&
+            _cameraController!.value.isStreamingImages) {
           _cameraController!.stopImageStream();
         }
         _triggerAutoCapture();
       }
     } catch (e, stack) {
-      debugPrint('Error analyzing frame: $e\\n$stack');
+      debugPrint('Error analyzing frame: $e\n$stack');
     } finally {
       _isProcessingFrame = false;
     }
@@ -344,10 +379,11 @@ class _ScanScreenState extends State<ScanScreen>
   void _resetAnalysis() {
     _autoCaptureTimer?.cancel();
     _countdownController.reset();
+
     setState(() {
       _validationScore = 0.0;
       _stableFrameCount = 0;
-      _statusMessage = 'Position the forearm inside the guide frame';
+      _statusMessage = _config.initialPositionMessage;
       _statusColor = const Color(0xFFEF4444);
       _isCapturing = false;
       _isNavigating = false;
@@ -356,14 +392,13 @@ class _ScanScreenState extends State<ScanScreen>
   }
 
   void _triggerAutoCapture() {
-    if (_isCapturing || _isNavigating) {
-      return;
-    }
+    if (_isCapturing || _isNavigating) return;
     _countdownController.forward(from: 0.0);
-    _autoCaptureTimer = Timer(const Duration(milliseconds: 600), _takePicture);
+    _autoCaptureTimer =
+        Timer(const Duration(milliseconds: 600), _takePicture);
   }
 
-  // ── Capture ───────────────────────────────────────────────────────────────
+  // ── Capture ────────────────────────────────────────────────────────────────
   Future<void> _takePicture() async {
     if (_cameraController == null ||
         !_cameraController!.value.isInitialized ||
@@ -381,9 +416,7 @@ class _ScanScreenState extends State<ScanScreen>
       final XFile raw = await _cameraController!.takePicture();
       final File imageFile = File(raw.path);
 
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
       setState(() => _isNavigating = true);
 
       final result = await Navigator.push<Map<String, dynamic>>(
@@ -398,17 +431,16 @@ class _ScanScreenState extends State<ScanScreen>
         ),
       );
 
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
 
       if (result != null) {
         final newViews = [..._capturedViews, result];
         final nextStep = _currentStep + 1;
 
         setState(() {
-          _capturedViews.clear();
-          _capturedViews.addAll(newViews);
+          _capturedViews
+            ..clear()
+            ..addAll(newViews);
           _isNavigating = false;
         });
 
@@ -419,19 +451,21 @@ class _ScanScreenState extends State<ScanScreen>
           _finishCaptureSession();
         }
       } else {
-        // User retook — reset
+        // User tapped "Retake"
         _resetAnalysis();
       }
     } catch (e) {
       debugPrint('takePicture error: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to capture image: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to capture image: $e')),
+        );
+      }
       _resetAnalysis();
     }
   }
 
-  // ── Submit session ────────────────────────────────────────────────────────
+  // ── Submit session ─────────────────────────────────────────────────────────
   Future<void> _finishCaptureSession() async {
     showDialog(
       context: context,
@@ -446,7 +480,8 @@ class _ScanScreenState extends State<ScanScreen>
                 CircularProgressIndicator(),
                 SizedBox(height: 18),
                 Text('Uploading Scan…',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 16)),
                 SizedBox(height: 6),
                 Text('Syncing to medical storage…',
                     style: TextStyle(fontSize: 11, color: Colors.grey)),
@@ -462,15 +497,14 @@ class _ScanScreenState extends State<ScanScreen>
       _capturedViews,
     );
 
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
     Navigator.pop(context); // close dialog
 
     if (result) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('✓ Scan submitted successfully — awaiting doctor review.'),
+          content: Text(
+              '✓ Scan submitted successfully — awaiting doctor review.'),
           backgroundColor: Color(0xFF10B981),
           duration: Duration(seconds: 4),
         ),
@@ -488,15 +522,24 @@ class _ScanScreenState extends State<ScanScreen>
     }
   }
 
-  // ── Build ─────────────────────────────────────────────────────────────────
+  // ── Build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final bodyPart = widget.orthoCase['bodyPart'] ?? 'Forearm';
-    final side = widget.orthoCase['side'] ?? '';
-    final patientName = widget.orthoCase['patientName'] ?? 'Patient';
+    final bodyPart = widget.orthoCase['bodyPart']?.toString() ?? 'Forearm';
+    final side = widget.orthoCase['side']?.toString() ?? '';
+    final patientName =
+        widget.orthoCase['patientName']?.toString() ?? 'Patient';
     final angle = _angles[_currentStep];
-    final instruction = _angleInstructions[angle] ??
-        {'title': angle.toUpperCase(), 'body': 'Align the limb in the frame.'};
+    final config = _config;
+
+    // Per-angle instruction for current body part + angle
+    final instruction = config.angleInstructions[angle] ??
+        AngleInstruction(title: angle.toUpperCase(), body: 'Align the limb in the frame.');
+
+    // Responsive overlay dimensions
+    final screenSize = MediaQuery.of(context).size;
+    final overlayWidth = screenSize.width * 0.60;
+    final overlayHeight = screenSize.height * 0.47;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -515,10 +558,10 @@ class _ScanScreenState extends State<ScanScreen>
           : Stack(
               fit: StackFit.expand,
               children: [
-                // ── Layer 1: Camera feed ────────────────────────────────────
+                // ── Layer 1: Camera feed ──────────────────────────────────
                 CameraPreview(_cameraController!),
 
-                // ── Layer 2: Semi-transparent vignette ─────────────────────
+                // ── Layer 2: Vignette ─────────────────────────────────────
                 IgnorePointer(
                   child: DecoratedBox(
                     decoration: BoxDecoration(
@@ -534,20 +577,21 @@ class _ScanScreenState extends State<ScanScreen>
                   ),
                 ),
 
-                // ── Layer 3: Anatomical guide overlay ─────────────────────
+                // ── Layer 3: Anatomical guide overlay (responsive) ────────
                 Align(
                   alignment: const Alignment(0, 0.04),
                   child: SizedBox(
-                    width: 230,
-                    height: 380,
+                    width: overlayWidth,
+                    height: overlayHeight,
                     child: AnimatedBuilder(
                       animation: _pulseController,
                       builder: (context, _) => CustomPaint(
-                        painter: ForearmGuidePainter(
+                        painter: BodyPartGuidePainter(
                           validationScore: _validationScore,
                           currentAngle: angle,
                           pulsePhase: _pulseController.value,
                           isCapturing: _isCapturing,
+                          bodyPart: bodyPart,
                         ),
                       ),
                     ),
@@ -597,7 +641,7 @@ class _ScanScreenState extends State<ScanScreen>
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              instruction['title']!,
+                              instruction.title,
                               style: TextStyle(
                                 color: _statusColor,
                                 fontWeight: FontWeight.bold,
@@ -607,7 +651,7 @@ class _ScanScreenState extends State<ScanScreen>
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              '$bodyPart${side.isEmpty ? '' : ' · $side'} — ${instruction['body']}',
+                              '$bodyPart${side.isEmpty ? '' : ' · $side'} — ${instruction.body}',
                               style: const TextStyle(
                                   color: Colors.white70, fontSize: 11),
                             ),
@@ -649,10 +693,12 @@ class _ScanScreenState extends State<ScanScreen>
                                 decoration: BoxDecoration(
                                   shape: BoxShape.circle,
                                   color: _statusColor.withValues(
-                                      alpha: 0.5 + 0.5 * _pulseController.value),
+                                      alpha: 0.5 +
+                                          0.5 * _pulseController.value),
                                   boxShadow: [
                                     BoxShadow(
-                                      color: _statusColor.withValues(alpha: 0.6),
+                                      color: _statusColor
+                                          .withValues(alpha: 0.6),
                                       blurRadius: 6,
                                     ),
                                   ],
@@ -702,7 +748,7 @@ class _ScanScreenState extends State<ScanScreen>
                           ),
                           const SizedBox(width: 24),
 
-                          // Shutter button — shows countdown ring overlay
+                          // Shutter button with countdown ring overlay
                           GestureDetector(
                             onTap: _validationScore >= 1.0 && !_isCapturing
                                 ? _takePicture
@@ -712,7 +758,6 @@ class _ScanScreenState extends State<ScanScreen>
                               builder: (_, child) => Stack(
                                 alignment: Alignment.center,
                                 children: [
-                                  // Progress ring
                                   SizedBox(
                                     width: 80,
                                     height: 80,
@@ -725,7 +770,6 @@ class _ScanScreenState extends State<ScanScreen>
                                       ),
                                     ),
                                   ),
-                                  // Main button
                                   Container(
                                     width: 68,
                                     height: 68,
@@ -748,15 +792,18 @@ class _ScanScreenState extends State<ScanScreen>
                                             child: SizedBox(
                                               width: 26,
                                               height: 26,
-                                              child: CircularProgressIndicator(
-                                                  color: Color(0xFF6366F1),
-                                                  strokeWidth: 2.5),
+                                              child:
+                                                  CircularProgressIndicator(
+                                                color: Color(0xFF6366F1),
+                                                strokeWidth: 2.5,
+                                              ),
                                             ),
                                           )
                                         : Icon(
                                             _validationScore >= 1.0
                                                 ? Icons.camera_alt_rounded
-                                                : Icons.camera_alt_outlined,
+                                                : Icons
+                                                    .camera_alt_outlined,
                                             color: _validationScore >= 1.0
                                                 ? const Color(0xFF059669)
                                                 : Colors.grey[600],
@@ -770,7 +817,7 @@ class _ScanScreenState extends State<ScanScreen>
 
                           const SizedBox(width: 24),
 
-                          // Skip / manual override button
+                          // Manual override / skip button
                           GestureDetector(
                             onTap: !_isCapturing ? _takePicture : null,
                             child: Container(
@@ -799,7 +846,7 @@ class _ScanScreenState extends State<ScanScreen>
     );
   }
 
-  // ── Step dot indicator ────────────────────────────────────────────────────
+  // ── Step dot indicator ──────────────────────────────────────────────────────
   Widget _buildStepDots() {
     return Row(
       mainAxisSize: MainAxisSize.min,
